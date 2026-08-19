@@ -155,6 +155,12 @@ and another queued turn cannot reuse a settled lease. A steer roll and a
 compaction resume open the lease as `voidOnAttemptError`, because the work they
 promise only exists if the current attempt succeeds — an error terminal voids
 them, while independently queued or deferred work survives it.
+Every Agent turn, including the first fresh turn, also opens a distinct
+`runtime-ownership` lease before handoff. Reservation consumes that exact
+identity; a rejected handoff releases it explicitly. During Stop, a
+runtime-owned row or transition buffer is represented by a reducer-visible
+runtime-ownership lease until terminal recovery finishes, so Topic quiescence
+never depends on a promise registered after the Stop decision.
 The source row's terminal event is marked `row-roll`; lifecycle consumers must
 not treat it as completion of the work that continues in A2.
 

@@ -74,7 +74,16 @@ vi.mock('@application', async () => {
   const { mockApplicationFactory } = await import('@test-mocks/main/application')
   return mockApplicationFactory({
     AiStreamManager: { abort: mockStreamAbort },
-    ChannelManager: { enqueueTerminalDelivery: mockEnqueueTerminalDelivery }
+    ChannelManager: {
+      updateLive: (request: any) => {
+        const adapter = deliveryAdapter.current
+        if (!adapter) return false
+        void adapter.onTextUpdate(request.chatId, request.text, request.responseOptions)
+        return true
+      },
+      enqueueTerminal: mockEnqueueTerminalDelivery,
+      isActive: () => true
+    }
   } as never)
 })
 

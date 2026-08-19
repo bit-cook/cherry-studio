@@ -1,10 +1,5 @@
 import { loggerService } from '@logger'
-import {
-  type ChannelAdapter,
-  type ChannelTerminalDeliveryOwner,
-  sanitizeChannelOutput,
-  type SendMessageOptions
-} from '@main/ai/channels'
+import { type ChannelDeliveryOwner, sanitizeChannelOutput, type SendMessageOptions } from '@main/ai/channels'
 import type { UniqueModelId } from '@shared/data/types/model'
 import type { UIMessageChunk } from 'ai'
 
@@ -41,8 +36,8 @@ export class ChannelAdapterListener implements StreamListener {
   }
 
   constructor(
-    private readonly deliveryOwner: ChannelTerminalDeliveryOwner,
-    private readonly adapter: ChannelAdapter,
+    private readonly deliveryOwner: ChannelDeliveryOwner,
+    private readonly channelId: string,
     private readonly platformChatId: string,
     /**
      * Skip the generic `Error: …` channel message on failure. Scheduled-task runs
@@ -54,11 +49,17 @@ export class ChannelAdapterListener implements StreamListener {
     private readonly responseOptions?: SendMessageOptions
   ) {
     const responseKey = this.responseOptions?.replyToMessageId ?? 'unthreaded'
-    this.id = `channel:${adapter.channelId}:${this.platformChatId}:${responseKey}`
+    this.id = `channel:${channelId}:${this.platformChatId}:${responseKey}`
   }
 
-  private updateStream(text: string): Promise<void> {
-    return this.adapter.onTextUpdate(this.platformChatId, text, this.responseOptions)
+  private updateStream(text: string, attemptId: number | undefined): void {
+    this.deliveryOwner.updateLive({
+      channelId: this.channelId,
+      chatId: this.platformChatId,
+      attemptId,
+      text,
+      ...(this.responseOptions ? { responseOptions: this.responseOptions } : {})
+    })
   }
 
   /** Submit stable data, never a closure — the queue must not retain this listener (C3).
@@ -71,9 +72,9 @@ export class ChannelAdapterListener implements StreamListener {
   ): void {
     if (this.terminalDeliveryQueued) return
     this.terminalDeliveryQueued = true
-    this.deliveryOwner.enqueueTerminalDelivery({
+    this.deliveryOwner.enqueueTerminal({
       id: `stream:${this.deliveryListenerId}:${event}:${attemptId ?? 'unscoped'}`,
-      channelId: this.adapter.channelId,
+      channelId: this.channelId,
       chatId: this.platformChatId,
       event,
       text,
@@ -91,8 +92,7 @@ export class ChannelAdapterListener implements StreamListener {
       // the live delivery path that reaches the IM platform, so secrets (keys/tokens) must
       // be redacted before they leave.
       const { text } = sanitizeChannelOutput(this.accumulatedText)
-      const update = this.updateStream(text.replace(INCOMPLETE_CITATION_MARKER_PATTERN, ''))
-      void update.catch(() => {})
+      this.updateStream(text.replace(INCOMPLETE_CITATION_MARKER_PATTERN, ''), attemptId)
     }
   }
 
@@ -101,7 +101,7 @@ export class ChannelAdapterListener implements StreamListener {
     const text = sanitizeChannelOutput(this.accumulatedText).text.trim()
     if (!text) {
       logger.warn('ChannelAdapterListener.onDone with empty text', {
-        channelId: this.adapter.channelId,
+        channelId: this.channelId,
         chatId: this.platformChatId,
         status: result.status
       })
@@ -131,6 +131,6 @@ export class ChannelAdapterListener implements StreamListener {
   }
 
   isAlive(): boolean {
-    return this.adapter.connected
+    return this.deliveryOwner.isActive()
   }
 }

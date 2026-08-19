@@ -39,7 +39,7 @@ vi.mock('@application', async () => {
   return mockApplicationFactory({
     AiStreamManager: { abort: vi.fn() },
     ChannelManager: { getAdapter: () => undefined },
-    ChannelTerminalDeliveryService: { enqueue: () => true }
+    ChannelDeliveryService: { updateLive: () => true, enqueueTerminal: () => true, isActive: () => true }
   } as never)
 })
 

@@ -2,9 +2,9 @@ import { application } from '@application'
 import { loggerService } from '@logger'
 import { BaseService, DependsOn, Injectable, Phase, ServicePhase } from '@main/core/lifecycle'
 
-import type { ChannelDeliveryRequest } from './ChannelManager'
+import type { ChannelDeliveryRequest, ChannelLiveUpdateRequest } from './ChannelManager'
 
-const logger = loggerService.withContext('ChannelTerminalDeliveryService')
+const logger = loggerService.withContext('ChannelDeliveryService')
 
 const TERMINAL_DELIVERY_DEDUP_LIMIT = 4096
 /** Bounded ownership window for one external send. Policy, not an invariant — see C2. */
@@ -21,15 +21,16 @@ const TERMINAL_DELIVERY_TIMEOUT_MS = 15_000
  * Adapter resolution goes through `ChannelManager`, which this service depends on — so a delivery
  * enqueued before a reconnect sends through the adapter that is live at send time.
  */
-@Injectable('ChannelTerminalDeliveryService')
+@Injectable('ChannelDeliveryService')
 @ServicePhase(Phase.WhenReady)
 @DependsOn(['ChannelManager'])
-export class ChannelTerminalDeliveryService extends BaseService {
+export class ChannelDeliveryService extends BaseService {
   private readonly queues = new Map<string, { channelId: string; requests: ChannelDeliveryRequest[] }>()
   private readonly runners = new Map<string, { channelId: string; promise: Promise<void> }>()
   private readonly deliveryIds = new Set<string>()
   private readonly blockedChannelIds = new Set<string>()
   private readonly connectionEpochs = new Map<string, number>()
+  private readonly liveEpochControllers = new Map<string, AbortController>()
   private accepting = false
 
   protected async onReady(): Promise<void> {
@@ -46,6 +47,8 @@ export class ChannelTerminalDeliveryService extends BaseService {
     this.deliveryIds.clear()
     this.blockedChannelIds.clear()
     this.connectionEpochs.clear()
+    for (const controller of this.liveEpochControllers.values()) controller.abort('channel-delivery-stop')
+    this.liveEpochControllers.clear()
   }
 
   /** Accepting is enabled on ready; tests and `ChannelManager.start()` re-arm it explicitly. */
@@ -53,15 +56,20 @@ export class ChannelTerminalDeliveryService extends BaseService {
     this.accepting = true
     this.blockedChannelIds.clear()
     this.connectionEpochs.clear()
+    for (const controller of this.liveEpochControllers.values()) controller.abort('channel-delivery-reset')
+    this.liveEpochControllers.clear()
   }
 
   /** Stop accepting new work. Queued deliveries still settle — see `drain`. */
   close(): void {
     this.accepting = false
+    for (const controller of this.liveEpochControllers.values()) controller.abort('channel-delivery-close')
+    this.liveEpochControllers.clear()
   }
 
   block(channelId: string): void {
     this.blockedChannelIds.add(channelId)
+    this.abortLiveEpochs(channelId, 'channel-blocked')
     this.dropQueued(channelId)
   }
 
@@ -70,11 +78,41 @@ export class ChannelTerminalDeliveryService extends BaseService {
     const currentEpoch = this.connectionEpochs.get(channelId) ?? 0
     if (connectionEpoch <= currentEpoch) return
     this.connectionEpochs.set(channelId, connectionEpoch)
+    this.abortLiveEpochs(channelId, 'connection-replaced')
+    this.liveEpochControllers.set(`${channelId}\0${connectionEpoch}`, new AbortController())
     this.blockedChannelIds.delete(channelId)
   }
 
   isBlocked(channelId: string): boolean {
     return this.blockedChannelIds.has(channelId)
+  }
+
+  isActive(): boolean {
+    return this.accepting
+  }
+
+  updateLive(request: ChannelLiveUpdateRequest): boolean {
+    if (!this.accepting || this.blockedChannelIds.has(request.channelId)) return false
+    const resolved = application.get('ChannelManager').resolveConnectedAdapter(request.channelId)
+    if (!resolved || this.connectionEpochs.get(request.channelId) !== resolved.epoch) return false
+    const key = `${request.channelId}\0${resolved.epoch}`
+    const controller = this.liveEpochControllers.get(key)
+    if (!controller || controller.signal.aborted) return false
+    void resolved.adapter
+      .onTextUpdate(request.chatId, request.text, {
+        ...request.responseOptions,
+        signal: controller.signal
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return
+        logger.warn('Live channel update failed', {
+          channelId: request.channelId,
+          chatId: request.chatId,
+          attemptId: request.attemptId,
+          error
+        })
+      })
+    return true
   }
 
   /** Settle queued work, optionally narrowed to specific channels. */
@@ -85,7 +123,7 @@ export class ChannelTerminalDeliveryService extends BaseService {
     if (pending.length > 0) await Promise.allSettled(pending)
   }
 
-  enqueue(request: ChannelDeliveryRequest): boolean {
+  enqueueTerminal(request: ChannelDeliveryRequest): boolean {
     if (!this.accepting || this.blockedChannelIds.has(request.channelId)) {
       logger.warn('Rejected terminal channel delivery: channel is stopping or blocked', {
         deliveryId: request.id,
@@ -172,10 +210,18 @@ export class ChannelTerminalDeliveryService extends BaseService {
     })
   }
 
+  private abortLiveEpochs(channelId: string, reason: string): void {
+    for (const [key, controller] of this.liveEpochControllers) {
+      if (!key.startsWith(`${channelId}\0`)) continue
+      controller.abort(reason)
+      this.liveEpochControllers.delete(key)
+    }
+  }
+
   /** Resolve the adapter now, not at enqueue time, and perform the one bounded send. */
   private async send(request: ChannelDeliveryRequest): Promise<void> {
-    const adapter = application.get('ChannelManager').getConnectedAdapter(request.channelId)
-    if (!adapter) {
+    const resolved = application.get('ChannelManager').resolveConnectedAdapter(request.channelId)
+    if (!resolved || this.connectionEpochs.get(request.channelId) !== resolved.epoch) {
       logger.warn('Dropped terminal channel delivery: adapter is gone', {
         deliveryId: request.id,
         channelId: request.channelId,
@@ -183,14 +229,16 @@ export class ChannelTerminalDeliveryService extends BaseService {
       })
       return
     }
+    const { adapter } = resolved
 
     const controller = new AbortController()
     const attempt = async (): Promise<void> => {
-      if (
-        request.finalizeStream &&
-        (await adapter.onStreamComplete(request.chatId, request.text, request.responseOptions))
-      ) {
-        return
+      if (request.finalizeStream) {
+        const finalized = await adapter.onStreamComplete(request.chatId, request.text, {
+          ...request.responseOptions,
+          signal: controller.signal
+        })
+        if (controller.signal.aborted || finalized) return
       }
       const text = request.fallbackText ?? request.text
       await adapter.sendMessage(request.chatId, text, { ...request.responseOptions, signal: controller.signal })

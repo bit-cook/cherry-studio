@@ -56,7 +56,18 @@ vi.mock('@application', async () => {
   return mod.mockApplicationFactory({
     // ChannelManager + AiStreamManager aren't in the default mock service set; the
     // streaming path (post heartbeat-skip) reads both, so wire minimal stubs here.
-    ChannelManager: { getAdapter: mockGetAdapter, enqueueTerminalDelivery: mockEnqueueTerminalDelivery },
+    ChannelManager: {
+      getAdapter: mockGetAdapter,
+      updateLive: (request: any) => {
+        const adapter = mockGetAdapter(request.channelId)
+        if (!adapter) return false
+        void adapter.onTextUpdate(request.chatId, request.text, request.responseOptions)
+        return true
+      },
+      enqueueTerminal: mockEnqueueTerminalDelivery,
+      enqueueTerminalDelivery: mockEnqueueTerminalDelivery,
+      isActive: () => true
+    },
     AiStreamManager: { abort: mockAbort, removeListener: mockRemoveListener },
     AgentJobsService: { bindTaskSessionReuse: mockBindTaskSessionReuse },
     // Gate that keeps a reusing fire off a session with a live turn.

@@ -58,7 +58,7 @@ each subsystem.
 │  Terminal listeners:                                                 │
 │    PersistenceListener → MessageService / TemporaryChat / Translation
 │    WebContentsListener  → ai.stream.done directed event              │
-│    ChannelAdapterListener → ChannelTerminalDeliveryService FIFO       │
+│    ChannelAdapterListener → ChannelDeliveryService live + terminal    │
 │    SseListener          → res.write('[DONE]')                         │
 └──────────────────────────────────────────────────────────────────────┘
                                  ↓

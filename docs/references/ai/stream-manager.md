@@ -110,7 +110,7 @@ volume × audience width**.
 | Producer | Events | Source |
 |---|---|---|
 | `StreamExecution` loop | `UIMessageChunk` (per-chunk delta) | `AiService.streamText`'s `ReadableStream` |
-| `AiStreamManager` (state machine) | topic-level status transitions | `send()` → `pending`, first chunk → `streaming`, three terminal handlers → `done` / `error` / `aborted`, `awaiting-approval` on `tool-approval-request` |
+| Topic reducer | topic-level status transitions | reservation → `pending`, first chunk → `streaming`, terminal persistence → `done` / `error` / `aborted`, persisted open approval → `awaiting-approval` |
 
 ### Consumers
 
@@ -119,7 +119,7 @@ volume × audience width**.
 | `WebContentsListener` | chunk + terminal | explicit `attach` → `ActiveStream.listeners` |
 | `PersistenceListener` | terminal (durable write, gates settlement) | built by the provider / agent runtime, passed in `send()`'s `persistencePorts` → `ActiveStream.persistencePorts` |
 | `TraceFlushListener` | topic quiescence | built by chat / agent-session turn owners, passed in `send()`'s `cleanupPorts` → `ActiveStream.cleanupPorts` |
-| `ChannelAdapterListener` | chunk + terminal | caller injects a listener into `send()`; its terminal callback enqueues once into the `ChannelTerminalDeliveryService` per-chat FIFO |
+| `ChannelAdapterListener` | chunk + terminal | caller injects a listener into `send()`; it accumulates per-attempt text and submits live/terminal data to `ChannelDeliveryService` |
 | `SseListener` | chunk + terminal | caller injects a listener into `send()` |
 | UI indirect consumers (sidebar indicators, …) | topic status | `useSharedCacheValue('topic.stream.statuses.${topicId}')` |
 
@@ -263,12 +263,14 @@ continuations.
 
 `dispatchToListeners` calls `listener.isAlive()` before each notification and
 isolates listener failures. `ChannelAdapterListener` does not await the external
-platform: its terminal callback hands one delivery to
-`ChannelTerminalDeliveryService` and returns, so IM latency cannot hold
+platform: its callbacks hand delivery data to
+`ChannelDeliveryService` and return, so IM latency cannot hold
 renderer terminal state, trace cleanup, or topic eviction. The delivery
-service is the single FIFO/dedupe/timeout owner for both live stream results
-and scheduled-task notifications; `ChannelManager` owns only adapter connection
-epochs. A timeout blocks the whole channel and skips queued requests, while
+service is the single blocked-policy owner for generated live and terminal results,
+and the FIFO/dedupe/timeout owner for terminal and scheduled-task notifications;
+`ChannelManager` alone creates adapter connection epochs. Live updates use the
+current epoch's abort signal and are never retried. A timeout blocks the whole
+channel and skips queued requests, while
 only a newer successful connection epoch reopens it. Accepted work drains
 before `ChannelManager` disconnects the adapter, and a timed-out send is never
 retried because its remote result is uncertain.
@@ -574,7 +576,7 @@ interface SendResult {
 - **injected**: topic has a live stream (`pending` or `streaming`) and
   `models` is empty → `listeners` upsert by id; **no models are
   launched**. Reached by (a) a chat steer — the provider already persisted the
-  steer user row and `dispatch` enqueued it on `pendingSteers`; and (b) an
+  steer user row and the Topic reducer enqueued it on `pendingChatSteers`; and (b) an
   agent-session follow-up already enqueued on the session's `pendingTurns`. An
   empty-`models` send with no live stream is likewise a no-op (the row is
   already enqueued) — `send()` never throws on empty models.
@@ -632,8 +634,8 @@ unhandledRejection.
 
 | Exit path | Handler | Behaviour |
 |---|---|---|
-| Normal end | `onExecutionDone` | `exec.status = 'done'`, finalMessage persisted as `success` |
-| `signal.aborted` + `exec.status === 'aborted'` | `onExecutionPaused` | (Possibly partial) finalMessage persisted as `paused` |
+| Normal end | `onExecutionDone` | reducer transitions the exact attempt; finalMessage is persisted as `success` |
+| aborted attempt selected by reducer Stop | `onExecutionPaused` | (Possibly partial) finalMessage persisted as `paused` |
 | `streamErrorText` (in-stream `error` chunk) | `onExecutionError` | Error part folded into finalMessage, persisted as `error` |
 | Pre-stream or broadcast throw | `onExecutionError` | Same — error part folded, persisted |
 
@@ -748,7 +750,8 @@ is still streaming:
    steer message as a normal user row and returns an enqueue-only
    `PreparedDispatch` — no models, `pendingSteerUserMessageId` set.
 2. `dispatchStreamRequest` calls `manager.enqueuePendingSteer(topicId, id)`,
-   pushing the row onto the topic's `pendingSteers` FIFO, then `send()` — which,
+   atomically opening its exact work lease and pushing the row onto the Topic
+   reducer's `pendingChatSteers` FIFO, then `send()` — which,
    seeing the live stream, just upserts the subscriber (inject).
 3. The running turn's `steerYield` stop condition (OR'd into `stopWhen`) sees
    `hasPendingSteer` and stops the turn cleanly at the next step boundary
@@ -761,7 +764,7 @@ is still streaming:
 **Drop-on-abort:** a steer chains only after a clean `done`. If the turn is
 aborted (Stop) or errors, the queue is dropped and its persisted user rows stay
 in history as dangling messages the user can resend (`onExecutionPaused` /
-`onExecutionError` clear `pendingSteers`; a late steer landing after a non-clean
+`onExecutionError` issue reducer commands that clear `pendingChatSteers`; a late steer landing after a non-clean
 terminal is dropped by `enqueuePendingSteer`). A steer queued while a turn ends
 `awaiting-approval` does **not** chain until the approval's `continue-conversation`
 turn completes — chaining earlier would let the approval response be swallowed by
@@ -803,7 +806,7 @@ duplicated; the rest are stream-manager-specific.
 | Flow | Trigger | Mechanism | Terminal / result |
 |---|---|---|---|
 | Submit (standard) | `ai.stream.open` | `dispatchStreamRequest` → `prepareDispatch` (persist user msg, reserve placeholders, build listeners + persistence/cleanup ports + models) → `manager.send` → N × `runExecutionLoop` | `ai.stream.done`; `PersistenceListener.persistAssistant`; chat lifecycle `scheduleCleanup(30 s)` |
-| Steering — chat resubmit | `ai.stream.open` on a live chat topic | provider persists the steer user row + `enqueuePendingSteer` → `pendingSteers`; `steerYield` stops the running turn cleanly; `onExecutionDone` chains a `steer-continuation` | prior turn persisted as **`success`**; the continuation answers the steer — see [Steering](#steering) |
+| Steering — chat resubmit | `ai.stream.open` on a live chat topic | provider persists the steer user row + reducer `enqueue-chat-steer`; `steerYield` stops the running turn cleanly; `onExecutionDone` chains a `steer-continuation` that atomically consumes the queue head and lease | prior turn persisted as **`success`**; the continuation answers the steer — see [Steering](#steering) |
 | Agent-session follow-up | `ai.stream.open` on a live `agent-session:*` topic | provider persists the user row, `enqueueUserMessage` steers via `connection.redirect()` (no abort) or queues on `pendingTurns`; `manager.send` upserts the subscriber → `{ mode: 'injected' }` | steer folds into the current turn (rolled at a `steer-boundary`), else the next turn starts from `pendingTurns` — see [Agent Session Runtime](./agent-session-runtime.md#live-follow-up) |
 | Tool-approval pause+resume | approval-request chunk → `awaiting-approval` | decision via `ai.tool.respond_approval`; a live agent runtime resolves its registry entry, while MCP dispatches `continue-conversation` | card clears when the resumed stream broadcasts `pending` — see [Tool Approval](./tool-approval.md) |
 | Reconnect | `ai.stream.attach` on mount | `manager.attach`: `not-found` or register listener + one canonical replay plan shared by legacy/v2 | available tail is compacted and repaired consistently; attach never changes runtime state |
@@ -827,7 +830,7 @@ listener / persistence-port composition:
 | Scenario | Listeners + persistence ports | Effect |
 |---|---|---|
 | Renderer user message | `WebContentsListener` + `PersistenceListener` port | live UI + persist |
-| Channel bot reply | `ChannelAdapterListener` + agent-session persistence port | agents DB gates settlement; `ChannelTerminalDeliveryService` serializes the at-most-once IM delivery independently afterward |
+| Channel bot reply | `ChannelAdapterListener` + agent-session persistence port | agents DB gates settlement; `ChannelDeliveryService` owns live epoch cancellation plus serialized at-most-once terminal delivery |
 | Channel + user both watching | above + `WebContentsListener(B)` | parallel fan-out |
 | API server SSE | `SseListener` + `PersistenceListener` port | SSE push + persist |
 | Translate | `WebContentsListener` + `PersistenceListener(TranslationBackend)` port | live overlay + writes `data-translation` part on success |
@@ -886,7 +889,7 @@ the newest attempt, so stale terminal events cannot retire a replacement.
 **Topic status vs message status.** Don't conflate:
 
 - **Topic stream status** (SharedCache `topic.stream.statuses.${topicId}`):
-  one entry per topic, source of truth is `ActiveStream.status`, valid
+  one entry per topic, computed from the Topic aggregate selector when published, valid
   only while the `ActiveStream` exists (+ grace period).
 - **Assistant message status** (`AssistantMessageStatus`: `PENDING` /
   `PROCESSING` / `SUCCESS` / `ERROR`): one per assistant message,

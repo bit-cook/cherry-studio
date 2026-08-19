@@ -931,7 +931,13 @@ export class ChannelMessageHandler {
         userParts: [{ type: 'text', text: content }],
         listeners: [
           sentinel,
-          new ChannelAdapterListener(application.get('ChannelManager'), adapter, chatId, false, responseOptions)
+          new ChannelAdapterListener(
+            application.get('ChannelManager'),
+            adapter.channelId,
+            chatId,
+            false,
+            responseOptions
+          )
         ],
         headless: true,
         requireIdle: { expectedAgentId: session.agentId }

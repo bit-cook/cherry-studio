@@ -235,7 +235,9 @@ export async function runAgentTask(ctx: JobContext<AgentTaskInput>): Promise<Age
     if (!adapter) return []
     // Suppress the listener's generic `Error: …` — `notifyTaskError` below sends a richer
     // `[Task failed]` summary to the same chats, so leaving it on would double-notify.
-    return adapter.notifyChatIds.map((chatId) => new ChannelAdapterListener(channelManager, adapter, chatId, true))
+    return adapter.notifyChatIds.map(
+      (chatId) => new ChannelAdapterListener(channelManager, adapter.channelId, chatId, true)
+    )
   })
 
   const { signal: runSignal, dispose } = makeRunSignal(ctx.signal, timeoutMinutes)

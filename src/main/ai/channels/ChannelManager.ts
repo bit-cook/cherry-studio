@@ -40,8 +40,18 @@ export type ChannelDeliveryRequest = {
   finalizeStream?: boolean
 }
 
-export interface ChannelTerminalDeliveryOwner {
-  enqueueTerminalDelivery(delivery: ChannelDeliveryRequest): boolean
+export interface ChannelLiveUpdateRequest {
+  channelId: string
+  chatId: string
+  attemptId?: number
+  text: string
+  responseOptions?: SendMessageOptions
+}
+
+export interface ChannelDeliveryOwner {
+  updateLive(request: ChannelLiveUpdateRequest): boolean
+  enqueueTerminal(request: ChannelDeliveryRequest): boolean
+  isActive(): boolean
 }
 
 // Adapter factory registry -- adapters register themselves here. The factory
@@ -84,7 +94,7 @@ async function ensureAdapterLoaded(type: AgentChannelType): Promise<void> {
 @Injectable('ChannelManager')
 @ServicePhase(Phase.WhenReady)
 @DependsOn(['WindowManager'])
-export class ChannelManager extends BaseService implements ChannelTerminalDeliveryOwner {
+export class ChannelManager extends BaseService implements ChannelDeliveryOwner {
   private readonly adapters = new Map<string, ChannelAdapter>() // key: `${agentId}:${channelId}`
   private readonly qrWaiters = new Map<
     string,
@@ -93,6 +103,7 @@ export class ChannelManager extends BaseService implements ChannelTerminalDelive
   private readonly channelLogs = new ChannelLogBuffer()
   private readonly channelStatuses = new Map<string, ChannelStatusEvent>()
   private nextConnectionEpoch = 0
+  private readonly connectionEpochs = new Map<string, { adapter: ChannelAdapter; epoch: number }>()
 
   // ChannelIngressService starts adapters after producers are ready; this owner
   // keeps lifecycle stop so terminal delivery remains alive until producers stop.
@@ -159,6 +170,7 @@ export class ChannelManager extends BaseService implements ChannelTerminalDelive
     )
     await Promise.all(disconnects)
     this.adapters.clear()
+    this.connectionEpochs.clear()
     logger.info('Channel manager stopped')
   }
 
@@ -166,13 +178,25 @@ export class ChannelManager extends BaseService implements ChannelTerminalDelive
    * Accept terminal channel work without holding the stream settlement path.
    * One owner serializes sends per channel chat and drains them before adapter teardown.
    */
-  /** Delivery is owned by `ChannelTerminalDeliveryService`; kept here for existing callers. */
+  /** Delivery is owned by `ChannelDeliveryService`; kept here as the stable producer port. */
   enqueueTerminalDelivery(delivery: ChannelDeliveryRequest): boolean {
-    return this.delivery.enqueue(delivery)
+    return this.enqueueTerminal(delivery)
+  }
+
+  updateLive(request: ChannelLiveUpdateRequest): boolean {
+    return this.delivery.updateLive(request)
+  }
+
+  enqueueTerminal(request: ChannelDeliveryRequest): boolean {
+    return this.delivery.enqueueTerminal(request)
+  }
+
+  isActive(): boolean {
+    return this.delivery.isActive()
   }
 
   private get delivery() {
-    return application.get('ChannelTerminalDeliveryService')
+    return application.get('ChannelDeliveryService')
   }
 
   /**
@@ -225,6 +249,12 @@ export class ChannelManager extends BaseService implements ChannelTerminalDelive
     return adapter?.connected ? adapter : undefined
   }
 
+  resolveConnectedAdapter(channelId: string): { adapter: ChannelAdapter; epoch: number } | undefined {
+    const current = this.connectionEpochs.get(channelId)
+    if (!current || !current.adapter.connected || this.getAdapter(channelId) !== current.adapter) return undefined
+    return current
+  }
+
   /** Get buffered logs for a channel. */
   getChannelLogs(channelId: string): ChannelLogEntry[] {
     return this.channelLogs.get(channelId)
@@ -252,6 +282,7 @@ export class ChannelManager extends BaseService implements ChannelTerminalDelive
   async disconnectChannel(channelId: string, options: { suppressErrors?: boolean } = {}): Promise<void> {
     const { suppressErrors = true } = options
     this.delivery.block(channelId)
+    this.connectionEpochs.delete(channelId)
     await this.delivery.drain(new Set([channelId]))
     for (const [key, adapter] of this.adapters) {
       if (adapter.channelId !== channelId) continue
@@ -455,8 +486,11 @@ export class ChannelManager extends BaseService implements ChannelTerminalDelive
         // publish status or reopen delivery for the new connection.
         if (this.adapters.get(key) !== adapter) return
         if (status.connected) {
-          this.delivery.reopen(row.id, ++this.nextConnectionEpoch)
+          const epoch = ++this.nextConnectionEpoch
+          this.connectionEpochs.set(row.id, { adapter, epoch })
+          this.delivery.reopen(row.id, epoch)
         } else {
+          if (this.connectionEpochs.get(row.id)?.adapter === adapter) this.connectionEpochs.delete(row.id)
           this.delivery.block(row.id)
         }
         this.channelStatuses.set(status.channelId, status)
