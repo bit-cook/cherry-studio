@@ -51,64 +51,86 @@ export interface ExecutionOverlayApi {
   clear: () => void
 }
 
+interface TopicOverlayBinding {
+  readonly topicId: string
+  readonly consumer: object
+  uiMessages: CherryUIMessage[]
+  onFinish: UseExecutionOverlayOptions['onFinish']
+  refreshOnQuiesced: UseExecutionOverlayOptions['refreshOnQuiesced']
+  readonly getSeedMessages: () => CherryUIMessage[]
+}
+
+function createTopicOverlayBinding(topicId: string): TopicOverlayBinding {
+  const binding = {
+    topicId,
+    consumer: {},
+    uiMessages: [],
+    onFinish: undefined,
+    refreshOnQuiesced: undefined,
+    getSeedMessages: () => binding.uiMessages
+  } satisfies TopicOverlayBinding
+  return binding
+}
+
 export function useExecutionOverlay(
   topicId: string,
   activeExecutions: readonly ActiveExecution[],
   uiMessages: CherryUIMessage[],
   options: UseExecutionOverlayOptions = {}
 ): ExecutionOverlayApi {
-  // Identity of this consumer inside the service's refcount/contribution maps.
-  const consumer = useRef({}).current
-
-  const uiMessagesRef = useRef(uiMessages)
-  uiMessagesRef.current = uiMessages
-  const onFinishRef = useRef(options.onFinish)
-  onFinishRef.current = options.onFinish
-  const refreshOnQuiescedRef = useRef(options.refreshOnQuiesced)
-  refreshOnQuiescedRef.current = options.refreshOnQuiesced
-  const topicIdRef = useRef(topicId)
-  topicIdRef.current = topicId
+  const bindingRef = useRef<TopicOverlayBinding>(undefined)
+  if (!bindingRef.current || bindingRef.current.topicId !== topicId) {
+    bindingRef.current = createTopicOverlayBinding(topicId)
+  }
+  const binding = bindingRef.current
+  binding.uiMessages = uiMessages
+  binding.onFinish = options.onFinish
+  binding.refreshOnQuiesced = options.refreshOnQuiesced
 
   // Declared before the sync effect so acquisition (entry creation) always
   // precedes reader convergence for a new topicId.
   useEffect(() => {
-    executionStreamOverlayService.acquire(topicId)
-    const offFinish = executionStreamOverlayService.onFinish(topicId, (executionId, event) =>
-      onFinishRef.current?.(executionId, event)
+    executionStreamOverlayService.acquire(binding.topicId)
+    const offFinish = executionStreamOverlayService.onFinish(binding.topicId, (executionId, event) =>
+      binding.onFinish?.(executionId, event)
     )
     // The service owns the quiesce → refresh → retire handoff (and its retry);
     // this only lends it the consumer's DB refetch while mounted.
-    const offRefresh = refreshOnQuiescedRef.current
+    const offRefresh = binding.refreshOnQuiesced
       ? executionStreamOverlayService.registerRefreshPort(
-          topicId,
-          () => refreshOnQuiescedRef.current?.() ?? Promise.resolve()
+          binding.topicId,
+          () => binding.refreshOnQuiesced?.() ?? Promise.resolve()
         )
       : undefined
     return () => {
       offFinish()
       offRefresh?.()
-      executionStreamOverlayService.release(topicId, consumer)
+      executionStreamOverlayService.release(binding.topicId, binding.consumer)
     }
-  }, [consumer, topicId])
+  }, [binding])
 
-  const getSeedMessages = useCallback(() => uiMessagesRef.current, [])
   // No cleanup: departure must not cancel readers (release() handles removal).
   useEffect(() => {
-    executionStreamOverlayService.syncExecutions(topicId, consumer, activeExecutions, getSeedMessages)
-  }, [activeExecutions, consumer, getSeedMessages, topicId])
+    executionStreamOverlayService.syncExecutions(
+      binding.topicId,
+      binding.consumer,
+      activeExecutions,
+      binding.getSeedMessages
+    )
+  }, [activeExecutions, binding])
 
   const subscribe = useCallback(
-    (listener: () => void) => executionStreamOverlayService.subscribe(topicId, listener),
-    [topicId]
+    (listener: () => void) => executionStreamOverlayService.subscribe(binding.topicId, listener),
+    [binding]
   )
   const view = useSyncExternalStore(
     subscribe,
-    useCallback(() => executionStreamOverlayService.getView(topicId), [topicId])
+    useCallback(() => executionStreamOverlayService.getView(binding.topicId), [binding])
   )
 
-  const api = useRef<ExecutionOverlayApi>(undefined as never)
-  if (!api.current) {
-    api.current = {
+  const api = useRef<{ binding: TopicOverlayBinding; value: ExecutionOverlayApi }>(undefined)
+  if (!api.current || api.current.binding !== binding) {
+    const value: ExecutionOverlayApi = {
       overlay: view.overlay,
       liveAssistants: view.liveAssistants,
       attempts: view.attempts,
@@ -118,25 +140,28 @@ export function useExecutionOverlay(
       refreshError: view.refreshError,
       seedReservations: (messages, executions, activeNodeDecision, previousActiveNodeId) =>
         executionStreamOverlayService.seedReservations(
-          topicIdRef.current,
+          binding.topicId,
           messages,
           executions,
           activeNodeDecision,
           previousActiveNodeId,
-          getSeedMessages
+          binding.getSeedMessages
         ),
-      disposeOverlay: (messageId: string) =>
-        executionStreamOverlayService.disposeOverlay(topicIdRef.current, messageId),
-      reset: () => executionStreamOverlayService.reset(topicIdRef.current),
-      clear: () => executionStreamOverlayService.clear(topicIdRef.current)
+      disposeOverlay: (messageId: string) => executionStreamOverlayService.disposeOverlay(binding.topicId, messageId),
+      reset: () => executionStreamOverlayService.reset(binding.topicId),
+      clear: () => executionStreamOverlayService.clear(binding.topicId)
+    }
+    api.current = {
+      binding,
+      value
     }
   }
-  api.current.overlay = view.overlay
-  api.current.liveAssistants = view.liveAssistants
-  api.current.attempts = view.attempts
-  api.current.optimisticMessages = view.optimisticMessages
-  api.current.projectedExecutions = view.projectedExecutions
-  api.current.activeNodeOverride = view.activeNodeOverride
-  api.current.refreshError = view.refreshError
-  return api.current
+  api.current.value.overlay = view.overlay
+  api.current.value.liveAssistants = view.liveAssistants
+  api.current.value.attempts = view.attempts
+  api.current.value.optimisticMessages = view.optimisticMessages
+  api.current.value.projectedExecutions = view.projectedExecutions
+  api.current.value.activeNodeOverride = view.activeNodeOverride
+  api.current.value.refreshError = view.refreshError
+  return api.current.value
 }

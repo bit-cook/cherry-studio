@@ -138,6 +138,8 @@ vi.mock('@renderer/services/aiTransport/TopicStreamSubscription', () => ({
   }
 }))
 
+import { executionStreamOverlayService } from '@renderer/services/aiTransport'
+
 import { useExecutionOverlay } from '../useExecutionOverlay'
 
 let topicSeq = 0
@@ -219,6 +221,75 @@ afterEach(() => {
 })
 
 describe('useExecutionOverlay', () => {
+  it('keeps finish, refresh, seed, and API closures bound to their original topic across A→B', async () => {
+    const topicA = TOPIC
+    const topicB = `${TOPIC}-b`
+    const finishA = vi.fn()
+    const finishB = vi.fn()
+    const refreshA = vi.fn().mockResolvedValue(undefined)
+    const refreshB = vi.fn().mockResolvedValue(undefined)
+    const finishPorts = new Map<string, (executionId: string, event: any) => void>()
+    const refreshPorts = new Map<string, () => Promise<unknown>>()
+    const seedGetters = new Map<string, () => CherryUIMessage[]>()
+    const originalSync = executionStreamOverlayService.syncExecutions.bind(executionStreamOverlayService)
+    vi.spyOn(executionStreamOverlayService, 'onFinish').mockImplementation((topicId, listener) => {
+      finishPorts.set(topicId, listener)
+      return () => {}
+    })
+    vi.spyOn(executionStreamOverlayService, 'registerRefreshPort').mockImplementation((topicId, refresh) => {
+      refreshPorts.set(topicId, refresh)
+      return () => {}
+    })
+    vi.spyOn(executionStreamOverlayService, 'syncExecutions').mockImplementation(
+      (topicId, consumer, executions, getSeedMessages) => {
+        seedGetters.set(topicId, getSeedMessages)
+        originalSync(topicId, consumer, executions, getSeedMessages)
+      }
+    )
+
+    const uiA = [asst('anchor-a', [{ type: 'text', text: 'seed-a' }])]
+    const uiB = [asst('anchor-b', [{ type: 'text', text: 'seed-b' }])]
+    const { result, rerender } = renderHook(
+      ({ topicId, executions, ui, onFinish, refreshOnQuiesced }) =>
+        useExecutionOverlay(topicId, executions, ui, { onFinish, refreshOnQuiesced }),
+      {
+        initialProps: {
+          topicId: topicA,
+          executions: [exec(A, 'anchor-a', 1)],
+          ui: uiA,
+          onFinish: finishA,
+          refreshOnQuiesced: refreshA
+        }
+      }
+    )
+    const apiA = result.current
+
+    rerender({
+      topicId: topicB,
+      executions: [exec(B, 'anchor-b', 2)],
+      ui: uiB,
+      onFinish: finishB,
+      refreshOnQuiesced: refreshB
+    })
+
+    expect(seedGetters.get(topicA)?.()).toEqual(uiA)
+    expect(seedGetters.get(topicB)?.()).toEqual(uiB)
+    finishPorts.get(topicA)?.(A, {
+      attemptId: 1,
+      message: uiA[0],
+      isAbort: false,
+      isError: false
+    })
+    await refreshPorts.get(topicA)?.()
+    expect(finishA).toHaveBeenCalledOnce()
+    expect(finishB).not.toHaveBeenCalled()
+    expect(refreshA).toHaveBeenCalledOnce()
+    expect(refreshB).not.toHaveBeenCalled()
+
+    act(() => apiA.clear())
+    expect(result.current.projectedExecutions).toEqual([exec(B, 'anchor-b', 2)])
+  })
+
   it('N1 — anchored overlay isolation: each execution lands only on its own anchor', async () => {
     const ui = [asst('anchor-a'), asst('anchor-b')]
     const { result } = renderHook(() =>

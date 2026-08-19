@@ -110,6 +110,15 @@ export function useChatRuntimeState({
 
   const [translationOverlay, setTranslationOverlayMap] = useState<Record<string, TranslationOverlayEntry>>({})
   const runtimeBranchLiveStatePublishedRef = useRef(false)
+  const runtimeBranchTopicIdRef = useRef(topic.id)
+  useEffect(() => {
+    if (runtimeBranchTopicIdRef.current !== topic.id) {
+      runtimeBranchTopicIdRef.current = topic.id
+      if (!runtimeBranchLiveStatePublishedRef.current) return
+      runtimeBranchLiveStatePublishedRef.current = false
+      onBranchLiveStateChange?.(null)
+    }
+  }, [onBranchLiveStateChange, topic.id])
   const setTranslationOverlay = useCallback<TranslationOverlaySetter>((messageId, entry) => {
     setTranslationOverlayMap((prev) => {
       if (entry == null) {
@@ -131,7 +140,21 @@ export function useChatRuntimeState({
     })
   }, [])
 
-  const finishRef = useRef<((executionId: string, event: ExecutionFinishEvent) => void) | undefined>(undefined)
+  const cache = useTopicMessagesCache({ topicId: topic.id, mutate: messagesCacheMutate })
+  const handleExecutionFinish = useCallback(
+    (_executionId: string, { message, isError }: ExecutionFinishEvent) => {
+      const treeCachePath = `/topics/${topic.id}/tree`
+      void (async () => {
+        try {
+          if (isError || !message.parts?.length) await cache.rollbackBranch()
+          await invalidateCache(treeCachePath)
+        } catch (err) {
+          logger.warn('failed to reconcile topic branch flow after execution finish', err as Error)
+        }
+      })()
+    },
+    [cache, invalidateCache, topic.id]
+  )
   const {
     overlay,
     liveAssistants,
@@ -140,7 +163,7 @@ export function useChatRuntimeState({
     activeNodeOverride,
     seedReservations: seedProjectionReservations
   } = useExecutionOverlay(topic.id, activeExecutions, messages, {
-    onFinish: (executionId, event) => finishRef.current?.(executionId, event),
+    onFinish: handleExecutionFinish,
     refreshOnQuiesced: refresh
   })
 
@@ -195,7 +218,6 @@ export function useChatRuntimeState({
     [toolApprovalComposerOverrides]
   )
 
-  const cache = useTopicMessagesCache({ topicId: topic.id, mutate: messagesCacheMutate })
   const seedMessagesCache = cache.seedReservedMessages
   const seedReservedMessages = useCallback(
     async (reservedMessages: CherryUIMessage[], options: ReservedMessageSeedOptions = {}) => {
@@ -301,24 +323,6 @@ export function useChatRuntimeState({
     partsByMessageId,
     topic.id
   ])
-
-  const handleExecutionFinish = useCallback(
-    (_executionId: string, { message, isError }: ExecutionFinishEvent) => {
-      const treeCachePath = `/topics/${topic.id}/tree`
-      void (async () => {
-        try {
-          if (isError || !message.parts?.length) {
-            await cache.rollbackBranch()
-          }
-          await invalidateCache(treeCachePath)
-        } catch (err) {
-          logger.warn('failed to reconcile topic branch flow after execution finish', err as Error)
-        }
-      })()
-    },
-    [cache, invalidateCache, topic.id]
-  )
-  finishRef.current = handleExecutionFinish
 
   const shouldRenderHomeComposer = false
 
