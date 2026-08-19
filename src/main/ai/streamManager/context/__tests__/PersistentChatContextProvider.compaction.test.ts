@@ -103,6 +103,7 @@ vi.mock('@application', async () => {
   const { mockApplicationFactory } = await import('../../../../../../tests/__mocks__/main/application')
   const base = mockApplicationFactory()
   const originalGet = base.application.get
+  const reservedPorts = new Map<AttemptId, { modelId: UniqueModelId; anchorMessageId?: string; port: any }>()
   base.application.get = vi.fn((name: string) => {
     if (name === 'AiStreamManager') {
       return {
@@ -125,7 +126,26 @@ vi.mock('@application', async () => {
           }
           return { receipt, rows: writePreparedRows(rows, receipt.activeNodeDecision) }
         },
-        failDispatchReservation: (_ticket: unknown, _topicId: string, _error: unknown, persist: () => void) => persist()
+        registerReservedAttemptTerminals: (
+          _topicId: string,
+          receipt: DispatchCommandReceipt,
+          bindings: Array<{ modelId: UniqueModelId; anchorMessageId?: string; port: any }>
+        ) => receipt.reservedAttemptIds?.forEach((attemptId, index) => reservedPorts.set(attemptId, bindings[index])),
+        settleDispatchPreparationFailure: (receipt: DispatchCommandReceipt, _topicId: string, error: unknown) =>
+          receipt.reservedAttemptIds?.forEach((attemptId) => {
+            const binding = reservedPorts.get(attemptId)
+            if (!binding) return
+            void binding.port.onError({
+              modelId: binding.modelId,
+              attemptId,
+              anchorMessageId: binding.anchorMessageId,
+              status: 'error',
+              error,
+              isTopicDone: false,
+              cycleId: 1,
+              controlRevision: 1
+            })
+          })
       }
     }
     if (name === 'FileManager') {

@@ -23,6 +23,7 @@ import { resolveAssistantModelId, resolveModels, resolvePersistentSiblingsGroupI
 // (`createUserMessageWithPlaceholders` → `getPathToNode`) without provider/model
 // resolution machinery. The history is what we assert on.
 const MODEL_ID = createUniqueModelId('openai', 'gpt-4o')
+const reservedPorts = vi.hoisted(() => new Map<number, { modelId: string; anchorMessageId?: string; port: any }>())
 const aiStreamManager = vi.hoisted(() => ({
   admitLiveExecutionChange: vi.fn(),
   awaitDispatchCommandReceipt: vi.fn(),
@@ -35,9 +36,31 @@ const aiStreamManager = vi.hoisted(() => ({
   ),
   commitDispatchCommand: vi.fn(),
   reserveDispatchCommand: vi.fn(),
-  failDispatchReservation: vi.fn(
-    (_ticket: DispatchCommandReceipt, _topicId: string, _error: unknown, persist: () => void) => persist()
-  )
+  registerReservedAttemptTerminals: vi.fn(
+    (
+      _topicId: string,
+      receipt: DispatchCommandReceipt,
+      bindings: Array<{ modelId: string; anchorMessageId?: string; port: any }>
+    ) => {
+      receipt.reservedAttemptIds?.forEach((attemptId, index) => reservedPorts.set(attemptId, bindings[index]))
+    }
+  ),
+  settleDispatchPreparationFailure: vi.fn((receipt: DispatchCommandReceipt, _topicId: string, error: unknown) => {
+    receipt.reservedAttemptIds?.forEach((attemptId) => {
+      const binding = reservedPorts.get(attemptId)
+      if (!binding) return
+      void binding.port.onError({
+        modelId: binding.modelId,
+        attemptId,
+        anchorMessageId: binding.anchorMessageId,
+        status: 'error',
+        error,
+        isTopicDone: false,
+        cycleId: 1,
+        controlRevision: 1
+      })
+    })
+  })
 }))
 aiStreamManager.commitDispatchCommand.mockImplementation(
   (topicId: string, intent: StreamIntent, commit: (receipt: DispatchCommandReceipt) => unknown) =>
@@ -99,6 +122,7 @@ describe('PersistentChatContextProvider — steer continuation history', () => {
   const PARTIAL = 'partial answer so far'
 
   beforeEach(async () => {
+    reservedPorts.clear()
     const [providerKey, modelKey] = generateOrderKeySequence(2)
     await dbh.db.insert(userProviderTable).values({ providerId: 'openai', name: 'OpenAI', orderKey: providerKey })
     await dbh.db.insert(userModelTable).values({
@@ -212,7 +236,7 @@ describe('PersistentChatContextProvider — steer continuation history', () => {
     const [userMessage] = messageService.getChildrenByParentId('a1')
     const [placeholder] = messageService.getChildrenByParentId(userMessage.id)
     expect(placeholder).toMatchObject({ role: 'assistant', status: 'error' })
-    expect(aiStreamManager.failDispatchReservation).toHaveBeenCalledTimes(1)
+    expect(aiStreamManager.settleDispatchPreparationFailure).toHaveBeenCalledTimes(1)
   })
 
   it('fills a reserved branch and creates its assistant placeholder when the topic is idle', async () => {
@@ -456,6 +480,8 @@ describe('PersistentChatContextProvider — steer continuation history', () => {
       {
         trigger: 'steer-continuation',
         topicId: 'topic-1',
+        chatSteerId: 'steer-1',
+        continuationLeaseId: 'steer-lease-1' as never,
         userMessageId: 'u2',
         fastMode: false
       } satisfies MainSteerContinuationRequest,

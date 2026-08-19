@@ -64,14 +64,15 @@ export function createChatStreamLifecycle(
       broadcast(stream, 'streaming')
     },
     onApprovalPendingChanged(stream) {
-      broadcast(stream, stream.status)
+      broadcast(stream, stream.aggregate.status())
     },
     onActiveExecutionsChanged(stream) {
-      broadcast(stream, stream.status)
+      broadcast(stream, stream.aggregate.status())
     },
     onTerminal(stream) {
-      const completedAt = broadcast(stream, stream.status)
-      if (stream.status === 'done' && completedAt !== undefined && stream.isPersistentConversation) {
+      const status = stream.aggregate.status()
+      const completedAt = broadcast(stream, status)
+      if (status === 'done' && completedAt !== undefined && stream.isPersistentConversation) {
         onConversationCompleted({
           topicId: stream.topicId,
           turnId: stream.turnId,

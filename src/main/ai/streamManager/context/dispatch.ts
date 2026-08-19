@@ -40,6 +40,9 @@ export interface MainSteerContinuationRequest {
   topicId: string
   /** The already-persisted steer user message to answer. */
   userMessageId: string
+  /** Exact reducer-owned steer and lease identities claimed by this continuation. */
+  chatSteerId: string
+  continuationLeaseId: import('../topicStreamState').ContinuationLeaseId
   /** Selection captured with the original busy submit. */
   reasoningEffort?: ReasoningEffortOption
   /** Fast selection captured with the original busy submit. */
@@ -165,7 +168,11 @@ export async function dispatchStreamRequest(
       req.trigger === 'continue-conversation'
         ? ({ kind: 'continue-conversation', anchorMessageId: req.parentAnchorId } as const)
         : req.trigger === 'steer-continuation'
-          ? ({ kind: 'steer-continuation' } as const)
+          ? ({
+              kind: 'steer-continuation',
+              leaseId: req.continuationLeaseId,
+              chatSteerId: req.chatSteerId
+            } as const)
           : ({ kind: 'start', modelCount: dispatch.models.length } as const)
     const handoff = (receipt: NonNullable<PreparedDispatch['receipt']>): AiStreamOpenResponse => {
       const preparedChange = dispatch.liveExecutionChange

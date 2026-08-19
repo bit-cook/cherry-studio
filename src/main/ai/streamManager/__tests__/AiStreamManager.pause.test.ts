@@ -86,9 +86,7 @@ interface ManagerInternals {
   inFlightDispatches: Map<Promise<unknown>, string>
   suppressedChatContinuationTopicIds: Set<string>
   inFlightChatContinuations: Map<string, Promise<void>>
-  pendingSteers: Map<string, Array<{ userMessageId: string }>>
   activeStreams: Map<string, ActiveStream>
-  startNextChatTurn(topicId: string): Promise<void>
 }
 
 function internals(mgr: ManagerInstance): ManagerInternals {
@@ -253,12 +251,12 @@ describe('AiStreamManager pause / drainInFlight (write quiesce)', () => {
 
     it('suppresses a paused startNextChatTurn without consuming the queue head', async () => {
       mgr.pause('test: suppression')
-      internals(mgr).pendingSteers.set('t', [{ userMessageId: 'u1' }, { userMessageId: 'u2' }])
-
-      await internals(mgr).startNextChatTurn('t')
+      mgr.enqueuePendingSteer('t', 'u1')
+      mgr.enqueuePendingSteer('t', 'u2')
+      await flush()
 
       // Queue intact (the steer stays answerable after release) and the topic recorded as debt.
-      expect(internals(mgr).pendingSteers.get('t')).toEqual([{ userMessageId: 'u1' }, { userMessageId: 'u2' }])
+      expect(mgr.hasPendingSteer('t')).toBe(true)
       expect(internals(mgr).suppressedChatContinuationTopicIds.has('t')).toBe(true)
       expect(mockDispatchStreamRequest).not.toHaveBeenCalled()
     })
@@ -454,8 +452,8 @@ describe('AiStreamManager pause / drainInFlight (write quiesce)', () => {
 
     it('re-kicks a suppressed steer continuation exactly once on last-hold release', async () => {
       const hold = mgr.pause('test: release kick')
-      internals(mgr).pendingSteers.set('t', [{ userMessageId: 'u1' }])
-      await internals(mgr).startNextChatTurn('t') // suppressed under the hold
+      mgr.enqueuePendingSteer('t', 'u1')
+      await flush()
       expect(internals(mgr).suppressedChatContinuationTopicIds.has('t')).toBe(true)
       expect(mockDispatchStreamRequest).not.toHaveBeenCalled()
 
@@ -474,7 +472,8 @@ describe('AiStreamManager pause / drainInFlight (write quiesce)', () => {
         userMessageId: 'u1'
       })
       expect(internals(mgr).suppressedChatContinuationTopicIds.size).toBe(0)
-      expect(internals(mgr).pendingSteers.has('t')).toBe(false)
+      // This test stubs dispatch before reservation; reducer tests cover exact queue consumption.
+      expect(mgr.hasPendingSteer('t')).toBe(true)
 
       // Exactly once — settling the launch spawns no second kick, and the registry empties.
       dispatchResolvers[0]()
@@ -485,8 +484,8 @@ describe('AiStreamManager pause / drainInFlight (write quiesce)', () => {
 
     it('newer hold inherits the suppressed-continuation debt', async () => {
       const hA = mgr.pause('holder-A')
-      internals(mgr).pendingSteers.set('t', [{ userMessageId: 'u1' }])
-      await internals(mgr).startNextChatTurn('t') // suppressed under A
+      mgr.enqueuePendingSteer('t', 'u1')
+      await flush()
       const hB = mgr.pause('holder-B')
 
       hA.dispose()

@@ -99,7 +99,7 @@ export interface StreamAttachAttemptSnapshot {
   attemptId: number
   anchorMessageId?: string
   seedFromEmpty?: boolean
-  phase: 'reserved' | 'running' | 'finalizing' | 'persistence-blocked' | 'settled'
+  phase: 'reserved' | 'running' | 'finalizing' | 'persistence-blocked' | 'awaiting-approval' | 'settled'
   outcome?: 'success' | 'paused' | 'error'
   error?: SerializedError
   replayChunks: StreamProtocolReplayChunkEvent[]

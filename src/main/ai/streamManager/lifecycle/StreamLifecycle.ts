@@ -22,7 +22,7 @@ export interface StreamLifecycle {
   onApprovalPendingChanged(stream: ActiveStream): void
   /** Called when a live turn replaces a terminal execution or appends a new model execution. */
   onActiveExecutionsChanged(stream: ActiveStream): void
-  /** Called once when `isTopicDone` flips; read `stream.status` for the final status. */
+  /** Called once when `isTopicDone` flips; derive final status from `stream.aggregate`. */
   onTerminal(stream: ActiveStream): void
   /** Returning false short-circuits `attach` to `'not-found'`. */
   canAttach(stream: ActiveStream): boolean

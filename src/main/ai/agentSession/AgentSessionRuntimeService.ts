@@ -63,6 +63,7 @@ import type {
   AgentSessionUsageCapture
 } from '../runtime/types'
 import {
+  type ContinuationLeaseId,
   dropEmptyContentParts,
   finalizeInterruptedParts,
   PersistenceListener,
@@ -149,6 +150,13 @@ export interface BeginAgentSessionTurnInput {
   messageSnapshot?: MessageSnapshot
   /** Only an untouched session's initial turn may run the two-stage automatic naming flow. */
   shouldAutoName?: boolean
+  /** Prepared before Topic reservation so fresh Agent admission consumes this exact owner. */
+  ownership?: AgentRuntimeTurnOwnership
+}
+
+export interface AgentRuntimeTurnOwnership {
+  readonly turnId: string
+  readonly leaseId: ContinuationLeaseId
 }
 
 export interface AgentSessionRuntimeHandle {
@@ -219,13 +227,15 @@ function toStreamOwned(topicId: string, result: SendResult): TurnPersistenceStat
 
 export interface AbortAgentSessionTurnResult {
   handled: boolean
-  /** Stop may publish the topic barrier after this attempt persisted or was explicitly abandoned. */
+  /** Agent lifecycle wait for the first terminal attempt; Topic ownership releases only on durable recovery. */
   terminalReady?: Promise<void>
   terminalOutcome?: { outcome: 'aborted' } | { outcome: 'error'; error?: SerializedError }
 }
 
 type AgentSessionTurn = {
   turnId: string
+  /** Exact Topic work lease while this row/buffer is runtime-owned. Handoff consumes it. */
+  ownershipLeaseId: ContinuationLeaseId
   /** True when the user message arrived as a steer — admission wraps it in a system-reminder. */
   systemReminder?: boolean
   assistantMessageId: string
@@ -252,7 +262,9 @@ type AgentSessionTurn = {
 
 type RuntimeTerminalRecovery = {
   sessionId: string
+  topicId: string
   turnId: string
+  ownershipLeaseId: ContinuationLeaseId
   assistantMessageId: string
   runtimeResumeToken?: string
   status: 'paused' | 'error'
@@ -452,17 +464,11 @@ export class AgentSessionRuntimeService extends BaseService {
     this.reconcileStalePendingMessages()
     this.registerInterval(() => this.retryBlockedRuntimeTerminalPersistence(), RUNTIME_TERMINAL_RETRY_INTERVAL_MS)
 
-    // Stop arrives as a published signal, not a call from the stream manager. Handled
-    // synchronously so the hold is registered before `abort()` classifies the topic.
+    // Stop arrives as a published signal, not a call from the stream manager. A runtime-owned
+    // terminal is projected synchronously into Topic state as a work lease before Stop reduces.
     this.registerDisposable(
       application.get('AiStreamManager').onTopicStop(({ topicId, reason }) => {
-        const result = this.abortPendingTurn(extractAgentSessionId(topicId), reason)
-        if (result.terminalReady) {
-          application.get('AiStreamManager').registerRuntimeTerminalHold(topicId, {
-            terminalReady: result.terminalReady,
-            terminalOutcome: result.terminalOutcome ?? { outcome: 'aborted' }
-          })
-        }
+        this.abortPendingTurn(extractAgentSessionId(topicId), reason)
       })
     )
 
@@ -578,17 +584,46 @@ export class AgentSessionRuntimeService extends BaseService {
   /** One handoff for queued, steer, receive-only, and deferred runtime turns. */
   private startRuntimeTurn(
     entry: AgentSessionRuntimeEntry,
+    turn: AgentSessionTurn,
     input: Omit<StartRuntimeTurnInput, 'admission'>
   ): SendResult {
+    const runtime = input.request.runtime
+    if (!runtime || runtime.kind !== 'agent-session') {
+      throw new Error(`Agent runtime turn ${entry.sessionId} is missing its exact turn identity`)
+    }
+    const streamManager = application.get('AiStreamManager')
+    const ownershipLeaseId = turn.ownershipLeaseId
     const continuationLeaseId = entry.runtimeState.continuationLease?.id
-    const result = application.get('AiStreamManager').startRuntimeTurn({
-      ...input,
-      admission: continuationLeaseId ? { kind: 'continuation', leaseId: continuationLeaseId } : { kind: 'fresh' }
-    })
+    let result: SendResult
+    try {
+      result = streamManager.startRuntimeTurn({
+        ...input,
+        admission: continuationLeaseId
+          ? { kind: 'continuation', leaseId: continuationLeaseId, ownershipLeaseId }
+          : { kind: 'fresh', ownershipLeaseId }
+      })
+    } catch (error) {
+      // Reservation did not consume the row owner. The runtime recovery path keeps this exact
+      // lease open until it persists the row terminal, then releases it through Topic.
+      throw error
+    }
     if (continuationLeaseId) {
       this.applyRuntimeStateEvent(entry, { type: 'continuation-lease-cleared', leaseId: continuationLeaseId }, false)
     }
     return result
+  }
+
+  private openRuntimeOwnershipLease(topicId: string, sessionId: string, turnId: string): ContinuationLeaseId {
+    const leaseId = toContinuationLeaseId(`agent-runtime-ownership:${sessionId}:${turnId}:${crypto.randomUUID()}`)
+    if (!application.get('AiStreamManager').openAgentRuntimeOwnershipLease(topicId, leaseId)) {
+      throw new Error(`Failed to open runtime ownership lease for session ${sessionId}`)
+    }
+    return leaseId
+  }
+
+  prepareTurnOwnership(topicId: string, sessionId: string): AgentRuntimeTurnOwnership {
+    const turnId = crypto.randomUUID()
+    return { turnId, leaseId: this.openRuntimeOwnershipLease(topicId, sessionId, turnId) }
   }
 
   private applyRuntimeStateEffect(
@@ -632,12 +667,14 @@ export class AgentSessionRuntimeService extends BaseService {
   }
 
   beginTurn(input: BeginAgentSessionTurnInput): AgentSessionRuntimeHandle {
-    const turnId = crypto.randomUUID()
+    const ownership = input.ownership ?? this.prepareTurnOwnership(input.topicId, input.sessionId)
+    const turnId = ownership.turnId
     const userMessage = input.userMessage ?? createSyntheticUserMessage(input.sessionId)
     const messageSnapshot = input.messageSnapshot ? structuredClone(input.messageSnapshot) : undefined
     const existing = this.entries.get(input.sessionId)
     const turn: AgentSessionTurn = {
       turnId,
+      ownershipLeaseId: ownership.leaseId,
       assistantMessageId: input.assistantMessageId,
       userMessage,
       modelId: input.modelId,
@@ -1650,7 +1687,9 @@ export class AgentSessionRuntimeService extends BaseService {
     })
     const recovery: RuntimeTerminalRecovery = {
       sessionId: entry.sessionId,
+      topicId: entry.topicId,
       turnId: turn.turnId,
+      ownershipLeaseId: turn.ownershipLeaseId,
       assistantMessageId: turn.assistantMessageId,
       ...(entry.lastResumeToken ? { runtimeResumeToken: entry.lastResumeToken } : {}),
       status,
@@ -1696,6 +1735,15 @@ export class AgentSessionRuntimeService extends BaseService {
         if (this.blockedRuntimeTerminalRecoveries.get(key) === recovery) {
           this.blockedRuntimeTerminalRecoveries.delete(key)
         }
+        await application
+          .get('AiStreamManager')
+          .completeAgentRuntimeOwnershipLease(
+            recovery.topicId,
+            recovery.ownershipLeaseId,
+            recovery.status === 'error'
+              ? { outcome: 'error', ...(recovery.error ? { error: recovery.error } : {}) }
+              : { outcome: 'aborted' }
+          )
         recovery.markDurable()
         return true
       } catch (error) {
@@ -3024,6 +3072,7 @@ export class AgentSessionRuntimeService extends BaseService {
     const turnId = crypto.randomUUID()
     const nextTurn: AgentSessionTurn = {
       turnId,
+      ownershipLeaseId: this.openRuntimeOwnershipLease(entry.topicId, entry.sessionId, turnId),
       systemReminder: pendingTurn.steer === true,
       assistantMessageId,
       userMessage: nextMessage,
@@ -3048,7 +3097,7 @@ export class AgentSessionRuntimeService extends BaseService {
         messages
       })
     }
-    const handoff = this.startRuntimeTurn(entry, {
+    const handoff = this.startRuntimeTurn(entry, nextTurn, {
       topicId: entry.topicId,
       modelId: entry.modelId,
       rootSpan,
@@ -3083,6 +3132,7 @@ export class AgentSessionRuntimeService extends BaseService {
     ) {
       return
     }
+    turn.ownershipLeaseId = this.openRuntimeOwnershipLease(entry.topicId, entry.sessionId, turn.turnId)
     turn.persistence = { kind: 'runtime-owned' }
     const suspended = application.get('AiStreamManager').suspendUnadmittedRuntimeTurn(entry.topicId)
     try {
@@ -3125,7 +3175,7 @@ export class AgentSessionRuntimeService extends BaseService {
         messages
       })
     }
-    const handoff = this.startRuntimeTurn(entry, {
+    const handoff = this.startRuntimeTurn(entry, turn, {
       topicId: entry.topicId,
       modelId: turn.modelId,
       rootSpan,
@@ -3189,6 +3239,7 @@ export class AgentSessionRuntimeService extends BaseService {
     const turnId = crypto.randomUUID()
     const receiveOnlyTurn: AgentSessionTurn = {
       turnId,
+      ownershipLeaseId: this.openRuntimeOwnershipLease(entry.topicId, entry.sessionId, turnId),
       assistantMessageId,
       userMessage: syntheticMessage,
       modelId,
@@ -3221,7 +3272,7 @@ export class AgentSessionRuntimeService extends BaseService {
         messages
       })
     }
-    const handoff = this.startRuntimeTurn(entry, {
+    const handoff = this.startRuntimeTurn(entry, receiveOnlyTurn, {
       topicId: entry.topicId,
       modelId,
       rootSpan,
@@ -3298,6 +3349,7 @@ export class AgentSessionRuntimeService extends BaseService {
     const turnId = crypto.randomUUID()
     const continuationTurn: AgentSessionTurn = {
       turnId,
+      ownershipLeaseId: this.openRuntimeOwnershipLease(entry.topicId, entry.sessionId, turnId),
       assistantMessageId,
       userMessage: steerMessage,
       modelId,
@@ -3332,7 +3384,7 @@ export class AgentSessionRuntimeService extends BaseService {
         messages
       })
     }
-    const handoff = this.startRuntimeTurn(entry, {
+    const handoff = this.startRuntimeTurn(entry, continuationTurn, {
       topicId: entry.topicId,
       modelId,
       rootSpan,

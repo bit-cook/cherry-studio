@@ -20,7 +20,10 @@ const events: AttemptEvent[] = [
   { type: 'fail', error },
   { type: 'abort', reason: 'user-requested' },
   { type: 'persisted' },
+  { type: 'approval-persisted' },
+  { type: 'approval-resumed' },
   { type: 'persist-failed', error, durableErrorWritten: false },
+  { type: 'abandon' },
   { type: 'approval-changed', pending: true }
 ]
 
@@ -55,11 +58,15 @@ describe('attemptMachine', () => {
     ],
     [
       { phase: 'finalizing', firstChunkAt: null, outcome: { kind: 'done' } } as AttemptState,
-      ['persisted', 'persist-failed', 'approval-changed']
+      ['persisted', 'approval-persisted', 'persist-failed', 'approval-changed']
+    ],
+    [
+      { phase: 'awaiting-approval', firstChunkAt: null } as AttemptState,
+      ['approval-resumed', 'abort', 'approval-changed']
     ],
     [
       { phase: 'persistence-blocked', firstChunkAt: null, outcome: { kind: 'error', error } } as AttemptState,
-      ['persisted', 'persist-failed', 'approval-changed']
+      ['persisted', 'persist-failed', 'abandon', 'approval-changed']
     ],
     [{ phase: 'settled', firstChunkAt: null, outcome: { kind: 'done' } } as AttemptState, []]
   ])('accepts only declared events from %s', (state, acceptedEvents) => {
@@ -116,10 +123,9 @@ describe('attemptMachine', () => {
     if (!result.ok) throw new Error('abandon must be legal on a blocked attempt')
 
     // Boot reconcile writes error for the row Stop left pending, so publication must match it.
-    expect(publishedOutcome(result.state as Exclude<AttemptState, { phase: 'reserved' | 'running' }>)).toEqual({
-      kind: 'error',
-      error
-    })
+    expect(
+      publishedOutcome(result.state as Exclude<AttemptState, { phase: 'reserved' | 'running' | 'awaiting-approval' }>)
+    ).toEqual({ kind: 'error', error })
     // ...while the runtime outcome survives, so a later successful replay is not demoted (P1).
     expect(result.state).toMatchObject({ outcome: { kind: 'done' } })
     // Abandoned is a durability terminal: it must let its topic quiesce.
@@ -129,11 +135,32 @@ describe('attemptMachine', () => {
       { phase: 'reserved' },
       { phase: 'running', firstChunkAt: 1 },
       { phase: 'finalizing', firstChunkAt: 1, outcome: { kind: 'done' } },
+      { phase: 'awaiting-approval', firstChunkAt: 1 },
       { phase: 'settled', firstChunkAt: 1, outcome: { kind: 'done' } }
     ]
     for (const state of nonBlocked) {
       expect(transition(state, { type: 'abandon' }).ok).toBe(false)
     }
+  })
+
+  it('keeps a persisted approval branch live until resume or Stop', () => {
+    const finalizing: AttemptState = { phase: 'finalizing', firstChunkAt: 10, outcome: { kind: 'done' } }
+    const awaiting = transition(finalizing, { type: 'approval-persisted' })
+    expect(awaiting).toEqual({ ok: true, state: { phase: 'awaiting-approval', firstChunkAt: 10 } })
+    if (!awaiting.ok) return
+
+    expect(transition(awaiting.state, { type: 'approval-resumed' })).toEqual({
+      ok: true,
+      state: { phase: 'settled', firstChunkAt: 10, outcome: { kind: 'done' } }
+    })
+    expect(transition(awaiting.state, { type: 'abort', reason: 'user-requested' })).toEqual({
+      ok: true,
+      state: {
+        phase: 'finalizing',
+        firstChunkAt: 10,
+        outcome: { kind: 'aborted', reason: 'user-requested' }
+      }
+    })
   })
 
   it('reduces running, approval, and terminal attempt sets deterministically', () => {
@@ -164,7 +191,15 @@ describe('attemptMachine', () => {
   })
 
   it('never regresses phase across generated event sequences', () => {
-    const rank = { reserved: 0, running: 1, finalizing: 2, 'persistence-blocked': 3, settled: 4 } as const
+    const rank = {
+      reserved: 0,
+      running: 1,
+      finalizing: 2,
+      'awaiting-approval': 2,
+      'persistence-blocked': 3,
+      settled: 4,
+      abandoned: 4
+    } as const
     let random = 0x18452
     const nextIndex = () => {
       random = (random * 1664525 + 1013904223) >>> 0

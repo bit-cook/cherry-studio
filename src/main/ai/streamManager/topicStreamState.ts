@@ -1,5 +1,6 @@
 import type { AttemptId } from '@shared/ai/attempt'
 import type { TopicStreamStatus } from '@shared/ai/transport'
+import type { ReasoningEffortOption } from '@shared/types/aiSdk'
 import type { SerializedError } from '@shared/types/error'
 
 import {
@@ -30,6 +31,9 @@ interface TopicContinuationLeaseBase {
   readonly voidOnAttemptError: boolean
   /** Diagnostics only. Reducers and selectors must not branch on this field. */
   readonly diagnosticOwner: 'agent-runtime' | 'chat-steer'
+  /** Continuations promise a future attempt; runtime ownership holds a row/buffer until handoff
+   *  or terminal persistence. Stop releases only the former. */
+  readonly kind: 'continuation' | 'runtime-ownership'
 }
 
 export type TopicContinuationLease =
@@ -50,13 +54,27 @@ export interface TopicStreamState {
   readonly lifecycle: StreamLifecycleState
   readonly attempts: ReadonlyMap<AttemptId, TopicAttemptState>
   readonly continuationLeases: ReadonlyMap<ContinuationLeaseId, TopicContinuationLease>
+  readonly pendingChatSteers: readonly PendingChatSteer[]
+}
+
+export interface PendingChatSteer {
+  readonly id: string
+  readonly leaseId: ContinuationLeaseId
+  readonly userMessageId: string
+  readonly reasoningEffort?: ReasoningEffortOption
+  readonly fastMode: boolean
 }
 
 export type TopicDispatchReservation =
-  | { readonly kind: 'fresh' }
+  | { readonly kind: 'fresh'; readonly ownershipLeaseId?: ContinuationLeaseId }
   | { readonly kind: 'live-change' }
-  | { readonly kind: 'approval-resume' }
-  | { readonly kind: 'continuation'; readonly leaseId: ContinuationLeaseId }
+  | { readonly kind: 'approval-resume'; readonly attemptId: AttemptId }
+  | {
+      readonly kind: 'continuation'
+      readonly leaseId: ContinuationLeaseId
+      readonly chatSteerId?: string
+      readonly ownershipLeaseId?: ContinuationLeaseId
+    }
 
 export type TopicStreamCommand =
   /** Reserves every attempt of one dispatch at a single revision, or none of them (T2). */
@@ -66,10 +84,15 @@ export type TopicStreamCommand =
   | { type: 'attempt-event'; attemptId: AttemptId; event: AttemptEvent }
   | { type: 'approval-changed'; attemptId: AttemptId; toolCallId: string; pending: boolean }
   | { type: 'approvals-cleared'; attemptId: AttemptId }
+  | { type: 'enqueue-chat-steer'; steer: PendingChatSteer }
+  | { type: 'drop-chat-steers'; reason: ContinuationReleaseReason }
+  | { type: 'stop-topic'; reason: string }
+  | { type: 'dispatch-preparation-failed'; attemptIds: readonly AttemptId[]; error: SerializedError }
   | {
       type: 'continuation-opened'
       leaseId: ContinuationLeaseId
       diagnosticOwner: 'agent-runtime' | 'chat-steer'
+      kind?: 'continuation' | 'runtime-ownership'
       voidOnAttemptError?: boolean
     }
   | { type: 'continuation-updated'; leaseId: ContinuationLeaseId; voidOnAttemptError: boolean }
@@ -94,10 +117,17 @@ export type TopicStreamEvent =
  */
 export type TopicStreamFlagEffect = { type: 'set-ring-eviction'; attemptId: AttemptId; paused: boolean }
 
+export type TopicStreamWorkEffect = {
+  type: 'stop-attempt'
+  attemptId: AttemptId
+  priorPhase: 'reserved' | 'running' | 'awaiting-approval'
+  reason: string
+}
+
 export const isFlagEffect = (effect: TopicStreamEffect): effect is TopicStreamFlagEffect =>
   effect.type === 'set-ring-eviction'
 
-export type TopicStreamEffect = TopicStreamFlagEffect
+export type TopicStreamEffect = TopicStreamFlagEffect | TopicStreamWorkEffect
 
 export type TopicCommandRejection =
   | 'stale-cycle'
@@ -124,7 +154,8 @@ export function createTopicStreamState(topicId: string, cycleId: number): TopicS
     revision: 0,
     lifecycle: 'active',
     attempts: new Map(),
-    continuationLeases: new Map()
+    continuationLeases: new Map(),
+    pendingChatSteers: []
   }
 }
 
@@ -183,20 +214,42 @@ export function reduceTopicStream(state: TopicStreamState, command: TopicStreamC
         command.reservation.kind === 'continuation'
           ? state.continuationLeases.get(command.reservation.leaseId)
           : undefined
+      const freshOwnershipLeaseId =
+        command.reservation.kind === 'fresh' ? command.reservation.ownershipLeaseId : undefined
       if (
         command.reservation.kind === 'fresh' &&
-        (stateHasUnsettledAttempts(state) || stateHasOpenLease(state) || stateHasPendingApprovals(state))
+        (stateHasUnsettledAttempts(state) ||
+          [...state.continuationLeases.values()].some(
+            (lease) => lease.state === 'open' && lease.id !== freshOwnershipLeaseId
+          ) ||
+          stateHasPendingApprovals(state))
       ) {
         return unchanged(state, 'busy')
+      }
+      if (command.reservation.kind === 'fresh' && command.reservation.ownershipLeaseId) {
+        const ownership = state.continuationLeases.get(command.reservation.ownershipLeaseId)
+        if (ownership?.state !== 'open' || ownership.kind !== 'runtime-ownership') {
+          return unchanged(state, 'invalid-continuation')
+        }
       }
       if (command.reservation.kind === 'live-change' && !stateHasRunningAttempts(state)) {
         return unchanged(state, 'busy')
       }
-      if (
-        command.reservation.kind === 'approval-resume' &&
-        (stateHasUnsettledAttempts(state) || stateHasOpenLease(state) || !stateHasPendingApprovals(state))
-      ) {
-        return unchanged(state, 'invalid-approval')
+      const approvalAttempt =
+        command.reservation.kind === 'approval-resume' ? state.attempts.get(command.reservation.attemptId) : undefined
+      if (command.reservation.kind === 'approval-resume') {
+        const approvalAttemptId = command.reservation.attemptId
+        const otherUnsettled = [...state.attempts.values()].some(
+          (attempt) => attempt.id !== approvalAttemptId && !isTerminalPhase(attempt.state)
+        )
+        if (
+          approvalAttempt?.state.phase !== 'awaiting-approval' ||
+          approvalAttempt.pendingApprovalToolCallIds.size === 0 ||
+          otherUnsettled ||
+          stateHasOpenLease(state)
+        ) {
+          return unchanged(state, 'invalid-approval')
+        }
       }
       if (command.reservation.kind === 'continuation' && continuation?.state !== 'open') {
         return unchanged(state, 'invalid-continuation')
@@ -204,15 +257,40 @@ export function reduceTopicStream(state: TopicStreamState, command: TopicStreamC
       if (command.reservation.kind === 'continuation' && stateHasUnsettledAttempts(state)) {
         return unchanged(state, 'busy')
       }
+      if (command.reservation.kind === 'continuation' && command.reservation.chatSteerId) {
+        const head = state.pendingChatSteers[0]
+        if (head?.id !== command.reservation.chatSteerId || head.leaseId !== command.reservation.leaseId) {
+          return unchanged(state, 'invalid-continuation')
+        }
+      }
       const attempts = new Map(state.attempts)
+      const effects: TopicStreamEffect[] = []
+      const events: TopicStreamEvent[] = []
+      if (command.reservation.kind === 'approval-resume' && approvalAttempt) {
+        const resumed = transition(approvalAttempt.state, { type: 'approval-resumed' })
+        if (!resumed.ok) return unchanged(state, 'invalid-approval')
+        attempts.set(approvalAttempt.id, {
+          ...approvalAttempt,
+          state: resumed.state,
+          pendingApprovalToolCallIds: new Set()
+        })
+        events.push({ type: 'attempt-changed', attemptId: approvalAttempt.id, state: resumed.state })
+        events.push({ type: 'approval-changed', attemptId: approvalAttempt.id, pending: false })
+        effects.push({ type: 'set-ring-eviction', attemptId: approvalAttempt.id, paused: false })
+      }
       for (const id of command.attemptIds) {
         attempts.set(id, { id, state: { phase: 'reserved' }, pendingApprovalToolCallIds: new Set() })
       }
-      let next = withAttempts(state, attempts)
-      const events: TopicStreamEvent[] = command.attemptIds.map((attemptId) => ({
-        type: 'attempt-reserved',
-        attemptId
-      }))
+      let next: TopicStreamState = {
+        ...state,
+        attempts,
+        pendingChatSteers:
+          command.reservation.kind === 'continuation' && command.reservation.chatSteerId
+            ? state.pendingChatSteers.slice(1)
+            : state.pendingChatSteers,
+        revision: state.revision + 1
+      }
+      events.push(...command.attemptIds.map((attemptId): TopicStreamEvent => ({ type: 'attempt-reserved', attemptId })))
       if (command.reservation.kind === 'continuation' && continuation?.state === 'open') {
         const consumed: TopicContinuationLease = {
           ...continuation,
@@ -222,10 +300,36 @@ export function reduceTopicStream(state: TopicStreamState, command: TopicStreamC
         next = replaceLease(next, consumed)
         events.push({ type: 'continuation-changed', lease: consumed })
       }
+      if (command.reservation.kind === 'continuation' && command.reservation.ownershipLeaseId) {
+        const ownership = next.continuationLeases.get(command.reservation.ownershipLeaseId)
+        if (ownership?.state !== 'open' || ownership.kind !== 'runtime-ownership') {
+          return unchanged(state, 'invalid-continuation')
+        }
+        const consumed: TopicContinuationLease = {
+          ...ownership,
+          state: 'consumed',
+          attemptId: command.attemptIds[0]
+        }
+        next = replaceLease(next, consumed)
+        events.push({ type: 'continuation-changed', lease: consumed })
+      }
+      if (command.reservation.kind === 'fresh' && command.reservation.ownershipLeaseId) {
+        const ownership = next.continuationLeases.get(command.reservation.ownershipLeaseId)
+        if (ownership?.state !== 'open' || ownership.kind !== 'runtime-ownership') {
+          return unchanged(state, 'invalid-continuation')
+        }
+        const consumed: TopicContinuationLease = {
+          ...ownership,
+          state: 'consumed',
+          attemptId: command.attemptIds[0]
+        }
+        next = replaceLease(next, consumed)
+        events.push({ type: 'continuation-changed', lease: consumed })
+      }
       return {
         state: next,
         events,
-        effects: [],
+        effects,
         changed: true
       }
     }
@@ -302,6 +406,128 @@ export function reduceTopicStream(state: TopicStreamState, command: TopicStreamC
       }
     }
 
+    case 'enqueue-chat-steer': {
+      if (state.pendingChatSteers.some((steer) => steer.id === command.steer.id)) return unchanged(state)
+      if (state.continuationLeases.has(command.steer.leaseId)) return unchanged(state, 'invalid-continuation')
+      const lease: TopicContinuationLease = {
+        id: command.steer.leaseId,
+        topicId: state.topicId,
+        cycleId: state.cycleId,
+        diagnosticOwner: 'chat-steer',
+        kind: 'continuation',
+        voidOnAttemptError: false,
+        state: 'open'
+      }
+      const continuationLeases = new Map(state.continuationLeases)
+      continuationLeases.set(lease.id, lease)
+      return {
+        state: {
+          ...state,
+          continuationLeases,
+          pendingChatSteers: [...state.pendingChatSteers, command.steer],
+          revision: state.revision + 1
+        },
+        events: [{ type: 'continuation-changed', lease }],
+        effects: [],
+        changed: true
+      }
+    }
+
+    case 'drop-chat-steers': {
+      if (state.pendingChatSteers.length === 0) return unchanged(state)
+      let next = state
+      const events: TopicStreamEvent[] = []
+      for (const steer of state.pendingChatSteers) {
+        const lease = next.continuationLeases.get(steer.leaseId)
+        if (lease?.state !== 'open') continue
+        const released: TopicContinuationLease = { ...lease, state: 'released', reason: command.reason }
+        next = replaceLease(next, released)
+        events.push({ type: 'continuation-changed', lease: released })
+      }
+      return {
+        state: { ...next, pendingChatSteers: [], revision: next.revision + 1 },
+        events,
+        effects: [],
+        changed: true
+      }
+    }
+
+    case 'stop-topic': {
+      const attempts = new Map(state.attempts)
+      const continuationLeases = new Map(state.continuationLeases)
+      const events: TopicStreamEvent[] = []
+      const effects: TopicStreamEffect[] = []
+      let changed = false
+
+      for (const attempt of state.attempts.values()) {
+        const phase = attempt.state.phase
+        if (phase !== 'reserved' && phase !== 'running' && phase !== 'awaiting-approval') continue
+        const stopped = transition(attempt.state, { type: 'abort', reason: command.reason })
+        if (!stopped.ok) continue
+        attempts.set(attempt.id, {
+          ...attempt,
+          state: stopped.state,
+          pendingApprovalToolCallIds: new Set()
+        })
+        events.push({ type: 'attempt-changed', attemptId: attempt.id, state: stopped.state })
+        if (attempt.pendingApprovalToolCallIds.size > 0) {
+          events.push({ type: 'approval-changed', attemptId: attempt.id, pending: false })
+          effects.push({ type: 'set-ring-eviction', attemptId: attempt.id, paused: false })
+        }
+        effects.push({ type: 'stop-attempt', attemptId: attempt.id, priorPhase: phase, reason: command.reason })
+        changed = true
+      }
+
+      for (const lease of state.continuationLeases.values()) {
+        if (lease.state !== 'open' || lease.kind === 'runtime-ownership') continue
+        const released: TopicContinuationLease = { ...lease, state: 'released', reason: 'stop' }
+        continuationLeases.set(lease.id, released)
+        events.push({ type: 'continuation-changed', lease: released })
+        changed = true
+      }
+
+      if (state.pendingChatSteers.length > 0) changed = true
+      if (!changed) return unchanged(state)
+      return {
+        state: {
+          ...state,
+          attempts,
+          continuationLeases,
+          pendingChatSteers: [],
+          revision: state.revision + 1
+        },
+        events,
+        effects,
+        changed: true
+      }
+    }
+
+    case 'dispatch-preparation-failed': {
+      const attempts = new Map(state.attempts)
+      const events: TopicStreamEvent[] = []
+      let changed = false
+      for (const attemptId of command.attemptIds) {
+        const attempt = attempts.get(attemptId)
+        if (!attempt || attempt.state.phase !== 'reserved') continue
+        const failed = transition(attempt.state, {
+          type: 'reservation-failed',
+          error: command.error,
+          durableErrorWritten: false
+        })
+        if (!failed.ok) continue
+        attempts.set(attemptId, { ...attempt, state: failed.state })
+        events.push({ type: 'attempt-changed', attemptId, state: failed.state })
+        changed = true
+      }
+      if (!changed) return unchanged(state)
+      return {
+        state: { ...state, attempts, revision: state.revision + 1 },
+        events,
+        effects: [],
+        changed: true
+      }
+    }
+
     case 'continuation-opened': {
       if (state.continuationLeases.has(command.leaseId)) return unchanged(state, 'invalid-continuation')
       const lease: TopicContinuationLease = {
@@ -309,6 +535,7 @@ export function reduceTopicStream(state: TopicStreamState, command: TopicStreamC
         topicId: state.topicId,
         cycleId: state.cycleId,
         diagnosticOwner: command.diagnosticOwner,
+        kind: command.kind ?? 'continuation',
         voidOnAttemptError: command.voidOnAttemptError === true,
         state: 'open'
       }
@@ -376,6 +603,7 @@ export function reduceTopicStream(state: TopicStreamState, command: TopicStreamC
           lifecycle: 'evicted',
           attempts: new Map(),
           continuationLeases: new Map(),
+          pendingChatSteers: [],
           revision: state.revision + 1
         },
         events: [{ type: 'lifecycle-changed', lifecycle: 'evicted' }],
@@ -463,10 +691,15 @@ export function runtimeOutcome(
   ) {
     return undefined
   }
+  if (attempts.some((attempt) => attempt.state.phase === 'awaiting-approval')) return 'awaiting-approval'
   if (attempts.some((attempt) => attempt.pendingApprovalToolCallIds.size > 0)) return 'awaiting-approval'
 
   const outcomes: AttemptOutcome[] = attempts.map((attempt) => {
-    if (attempt.state.phase === 'reserved' || attempt.state.phase === 'running') {
+    if (
+      attempt.state.phase === 'reserved' ||
+      attempt.state.phase === 'running' ||
+      attempt.state.phase === 'awaiting-approval'
+    ) {
       throw new Error(`Attempt ${attempt.id} has no runtime outcome`)
     }
     return attempt.state.outcome

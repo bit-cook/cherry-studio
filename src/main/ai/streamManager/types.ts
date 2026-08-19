@@ -1,7 +1,7 @@
 import type { Span } from '@opentelemetry/api'
 import type { AttemptId } from '@shared/ai/attempt'
 import type { CompactionAnchorData } from '@shared/ai/compaction'
-import type { StreamChunkPayload, TopicStreamStatus } from '@shared/ai/transport'
+import type { StreamChunkPayload } from '@shared/ai/transport'
 import type { CherryUIMessage, MessageRuntimeTiming } from '@shared/data/types/message'
 import type { UniqueModelId } from '@shared/data/types/model'
 import type { SerializedError } from '@shared/types/error'
@@ -209,7 +209,6 @@ export interface ActiveStream {
   executions: Map<UniqueModelId, StreamExecution>
   /** Shared across all executions. Key = `listener.id`. */
   listeners: Map<string, StreamListener>
-  status: TopicStreamStatus
   isMultiModel: boolean
   lifecycle: StreamLifecycle
   /** Snapshotted at admission so temporary/internal streams never emit a conversation completion. */

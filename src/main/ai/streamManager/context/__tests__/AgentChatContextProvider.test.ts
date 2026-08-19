@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   maybeRenameAgentSession: vi.fn(),
   applicationGet: vi.fn(),
   runtimeBeginTurn: vi.fn(),
+  runtimePrepareTurnOwnership: vi.fn(() => ({ turnId: 'turn-1', leaseId: 'ownership-1' })),
   runtimeEnqueueUserMessage: vi.fn(),
   runtimeIsSessionBusy: vi.fn(),
   runtimeValidateSession: vi.fn(),
@@ -146,6 +147,7 @@ describe('AgentChatContextProvider', () => {
       if (name === 'AgentSessionRuntimeService') {
         return {
           beginTurn: mocks.runtimeBeginTurn,
+          prepareTurnOwnership: mocks.runtimePrepareTurnOwnership,
           enqueueUserMessage: mocks.runtimeEnqueueUserMessage,
           isSessionBusy: mocks.runtimeIsSessionBusy
         }
@@ -169,7 +171,10 @@ describe('AgentChatContextProvider', () => {
               reservedAttemptIds: Array.from({ length: modelCount }, (_, index) => (index + 1) as AttemptId)
             }
             return { receipt, rows: writePreparedRows(rows, receipt.activeNodeDecision) }
-          }
+          },
+          releaseAgentRuntimeOwnershipLease: vi.fn(() => true),
+          registerReservedAttemptTerminals: vi.fn(),
+          settleDispatchPreparationFailure: vi.fn().mockResolvedValue(undefined)
         }
       }
       if (name === 'DbService') return { withWriteTx: (fn: (tx: object) => unknown) => fn({}) }
@@ -194,6 +199,11 @@ describe('AgentChatContextProvider', () => {
     )
     expect(mocks.saveMessagesTx).toHaveBeenCalledOnce()
     expect(mocks.saveMessage).not.toHaveBeenCalled()
+    expect(mocks.runtimePrepareTurnOwnership).toHaveBeenCalledWith('agent-session:session-1', 'session-1')
+    expect(mocks.issueDispatchCommandReceipt).toHaveBeenCalledWith('agent-session:session-1', {
+      kind: 'runtime-turn',
+      admission: { kind: 'fresh', ownershipLeaseId: 'ownership-1' }
+    })
     expect(provider.isPersistentConversation).toBe(true)
     const savedMessages = mocks.saveMessagesTx.mock.calls[0][1].messages
     expect(savedMessages[1]).toMatchObject({
@@ -250,7 +260,8 @@ describe('AgentChatContextProvider', () => {
         emoji: '🤖',
         model: { id: 'claude-sonnet', name: 'Claude Sonnet', provider: 'anthropic' }
       },
-      shouldAutoName: true
+      shouldAutoName: true,
+      ownership: { turnId: 'turn-1', leaseId: 'ownership-1' }
     })
     expect(prepared.listeners).toEqual([
       subscriber,

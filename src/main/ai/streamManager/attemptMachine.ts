@@ -19,6 +19,9 @@ export type AttemptState =
       outcome: AttemptOutcome
       persistError: SerializedError
     }
+  /** The provider round and its intermediate durable snapshot completed, but a tool approval
+   *  can still produce a continuation. This is live Topic work, not a terminal attempt. */
+  | { phase: 'awaiting-approval'; firstChunkAt: number | null }
   | { phase: 'settled'; firstChunkAt: number | null; outcome: AttemptOutcome }
   /** Stop gave up on a blocked write. Retains the ORIGINAL outcome (P1); `persistError` is what
    *  gets published, so renderer and boot-reconcile converge on the same terminal. */
@@ -37,6 +40,8 @@ export type AttemptEvent =
   | { type: 'fail'; error: SerializedError }
   | { type: 'abort'; reason: string }
   | { type: 'persisted' }
+  | { type: 'approval-persisted' }
+  | { type: 'approval-resumed' }
   | { type: 'persist-failed'; error: SerializedError; durableErrorWritten: boolean }
   /** Explicit user give-up on a blocked terminal write (Stop). Settles as error(persistError). */
   | { type: 'abandon' }
@@ -120,6 +125,10 @@ export function transition(state: AttemptState, event: AttemptEvent): Transition
       switch (event.type) {
         case 'persisted':
           return { ok: true, state: { phase: 'settled', firstChunkAt: state.firstChunkAt, outcome: state.outcome } }
+        case 'approval-persisted':
+          return state.outcome.kind === 'done'
+            ? { ok: true, state: { phase: 'awaiting-approval', firstChunkAt: state.firstChunkAt } }
+            : illegal()
         case 'persist-failed':
           // Durable error marker written → the DB already says error, runtime must match.
           // Not durable → keep the original outcome; only the write is blocked, not the turn.
@@ -142,6 +151,7 @@ export function transition(state: AttemptState, event: AttemptEvent): Transition
           return { ok: true, state }
         case 'launch':
         case 'reservation-failed':
+        case 'approval-resumed':
         case 'chunk':
         case 'complete':
         case 'fail':
@@ -149,6 +159,36 @@ export function transition(state: AttemptState, event: AttemptEvent): Transition
           return stale()
         case 'abandon':
           return illegal()
+      }
+      return illegal()
+    case 'awaiting-approval':
+      switch (event.type) {
+        case 'approval-resumed':
+          return {
+            ok: true,
+            state: { phase: 'settled', firstChunkAt: state.firstChunkAt, outcome: { kind: 'done' } }
+          }
+        case 'abort':
+          return {
+            ok: true,
+            state: {
+              phase: 'finalizing',
+              firstChunkAt: state.firstChunkAt,
+              outcome: { kind: 'aborted', reason: event.reason }
+            }
+          }
+        case 'approval-changed':
+          return { ok: true, state }
+        case 'launch':
+        case 'reservation-failed':
+        case 'chunk':
+        case 'complete':
+        case 'fail':
+        case 'persisted':
+        case 'approval-persisted':
+        case 'persist-failed':
+        case 'abandon':
+          return stale()
       }
       return illegal()
     case 'persistence-blocked':
@@ -185,6 +225,8 @@ export function transition(state: AttemptState, event: AttemptEvent): Transition
           return { ok: true, state }
         case 'launch':
         case 'reservation-failed':
+        case 'approval-persisted':
+        case 'approval-resumed':
         case 'chunk':
         case 'complete':
         case 'fail':
@@ -203,12 +245,15 @@ export function transition(state: AttemptState, event: AttemptEvent): Transition
  * rather than its retained runtime outcome, because boot reconcile will durably write that error
  * for the row Stop left `pending`.
  */
-export function publishedOutcome(state: Exclude<AttemptState, { phase: 'reserved' | 'running' }>): AttemptOutcome {
+export function publishedOutcome(
+  state: Exclude<AttemptState, { phase: 'reserved' | 'running' | 'awaiting-approval' }>
+): AttemptOutcome {
   return state.phase === 'abandoned' ? { kind: 'error', error: state.persistError } : state.outcome
 }
 
 export function executionStatus(state: AttemptState): ExecutionStatus {
   if (state.phase === 'reserved' || state.phase === 'running') return 'streaming'
+  if (state.phase === 'awaiting-approval') return 'done'
   const outcome = publishedOutcome(state)
   if (outcome.kind === 'done') return 'done'
   if (outcome.kind === 'error') return 'error'
@@ -227,15 +272,21 @@ export function isAttemptSettled(
 }
 
 export function reduceTopicStatus(attempts: ReadonlyArray<AttemptStatusInput>): TopicStreamStatus {
-  const unsettled = attempts.filter(({ state }) => !isAttemptSettled(state))
-  if (unsettled.length > 0) {
+  const active = attempts.filter(({ state }) => !isAttemptSettled(state) && state.phase !== 'awaiting-approval')
+  if (active.length > 0) {
     const hasFirstChunk = attempts.some(({ state }) => state.phase !== 'reserved' && state.firstChunkAt !== null)
     return hasFirstChunk ? 'streaming' : 'pending'
   }
 
-  if (attempts.some(({ pendingApprovals }) => pendingApprovals.size > 0)) return 'awaiting-approval'
+  if (
+    attempts.some(({ state, pendingApprovals }) => state.phase === 'awaiting-approval' || pendingApprovals.size > 0)
+  ) {
+    return 'awaiting-approval'
+  }
   const outcomes = attempts.flatMap(({ state }) =>
-    state.phase === 'reserved' || state.phase === 'running' ? [] : [publishedOutcome(state)]
+    state.phase === 'reserved' || state.phase === 'running' || state.phase === 'awaiting-approval'
+      ? []
+      : [publishedOutcome(state)]
   )
   if (outcomes.length === 0) return 'error'
   if (outcomes.some((outcome) => outcome.kind === 'error')) return 'error'

@@ -189,6 +189,8 @@ const fakeCacheService = {
 const mockSaveSpans = vi.fn<(topicId: string) => Promise<void>>(async () => undefined)
 let agentContinuationPromise: { open: boolean; voidOnAttemptError: boolean } | undefined
 let nextAgentContinuationLeaseSequence = 0
+let nextAgentOwnershipLeaseSequence = 0
+let nextRuntimeTerminalOwnershipLeaseSequence = 0
 
 vi.mock('@application', async () => {
   const { mockApplicationFactory } = await import('@test-mocks/main/application')
@@ -267,6 +269,12 @@ function openAgentContinuation(manager: ManagerInstance, topicId: string, voidOn
   return id
 }
 
+function openAgentOwnership(manager: ManagerInstance, topicId: string) {
+  const id = toContinuationLeaseId(`test-agent-ownership:${++nextAgentOwnershipLeaseSequence}`)
+  expect(manager.openAgentRuntimeOwnershipLease(topicId, id)).toBe(true)
+  return id
+}
+
 /**
  * Single-model convenience wrapper around `manager.send`.
  * Returns the resulting snapshot so tests can assert on observable state
@@ -321,10 +329,13 @@ describe('AiStreamManager', () => {
     mgr.onTopicStop(({ topicId, reason }) => {
       const result = mockAbortPendingTurn(extractAgentSessionId(topicId), reason)
       if (result?.terminalReady) {
-        mgr.registerRuntimeTerminalHold(topicId, {
-          terminalReady: result.terminalReady,
-          terminalOutcome: result.terminalOutcome ?? { outcome: 'aborted' }
-        })
+        const leaseId = toContinuationLeaseId(
+          `test-runtime-terminal-owner:${++nextRuntimeTerminalOwnershipLeaseSequence}`
+        )
+        expect(mgr.openAgentRuntimeOwnershipLease(topicId, leaseId)).toBe(true)
+        void result.terminalReady.then(() =>
+          mgr.completeAgentRuntimeOwnershipLease(topicId, leaseId, result.terminalOutcome ?? { outcome: 'aborted' })
+        )
       }
     })
     approvalRequestedEvents = []
@@ -338,6 +349,8 @@ describe('AiStreamManager', () => {
     mockSaveSpans.mockResolvedValue(undefined)
     agentContinuationPromise = undefined
     nextAgentContinuationLeaseSequence = 0
+    nextAgentOwnershipLeaseSequence = 0
+    nextRuntimeTerminalOwnershipLeaseSequence = 0
     mockAbortPendingTurn.mockReturnValue({ handled: false })
     mockGetMessageById.mockReset()
     sharedCacheStore.clear()
@@ -559,6 +572,9 @@ describe('AiStreamManager', () => {
       const listener = new FakeListener('wc:reserved-stop')
       const persistencePort = new FakePersistencePort('persistence:reserved-stop')
       const reservation = mgr.reserveDispatchCommand(topicId, { kind: 'start', modelCount: 1 }, 1, { kind: 'none' })
+      mgr.registerReservedAttemptTerminals(topicId, reservation.receipt, [
+        { modelId: 'provider-a::model-a', anchorMessageId: 'assistant-reserved', port: persistencePort }
+      ])
 
       mgr.abort(topicId, 'user-requested')
       const result = mgr.send({
@@ -587,15 +603,59 @@ describe('AiStreamManager', () => {
       expect(mgr.inspect(topicId)?.status).toBe('aborted')
     })
 
+    it('keeps a durably stopped reservation available for a delayed successful handoff', async () => {
+      const topicId = 'reserved-stop-delayed-handoff'
+      const listener = new FakeListener('wc:reserved-stop-delayed')
+      const persistencePort = new FakePersistencePort('persistence:reserved-stop-delayed')
+      const reservation = mgr.reserveDispatchCommand(topicId, { kind: 'start', modelCount: 1 }, 1, { kind: 'none' })
+      mgr.registerReservedAttemptTerminals(topicId, reservation.receipt, [
+        { modelId: 'provider-a::model-a', anchorMessageId: 'assistant-delayed', port: persistencePort }
+      ])
+      const inFlight = (mgr as unknown as { inFlightDispatches: Map<Promise<unknown>, string> }).inFlightDispatches
+      const dispatchMarker = Promise.resolve()
+      inFlight.set(dispatchMarker, topicId)
+
+      mgr.abort(topicId, 'user-requested')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(persistencePort.pausedResults).toHaveLength(1)
+
+      const result = mgr.send({
+        topicId,
+        models: [
+          {
+            modelId: 'provider-a::model-a',
+            request: { ...req(topicId), messageId: 'assistant-delayed' }
+          }
+        ],
+        listeners: [listener],
+        persistencePorts: [persistencePort],
+        receipt: reservation.receipt
+      })
+      inFlight.delete(dispatchMarker)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(result.mode).toBe('started')
+      expect(mockStreamText).not.toHaveBeenCalled()
+      expect(persistencePort.pausedResults).toHaveLength(1)
+      expect(listener.pausedResults).toEqual([
+        expect.objectContaining({ anchorMessageId: 'assistant-delayed', isTopicDone: true, status: 'paused' })
+      ])
+    })
+
     it('releases a failed dispatch reservation after its durable error write recovers', async () => {
       const topicId = 'reservation-recovery-topic'
       const intent = { kind: 'start' as const, modelCount: 1 }
       const { receipt } = mgr.reserveDispatchCommand(topicId, intent, 1, { kind: 'none' })
       let storageAvailable = false
 
-      mgr.failDispatchReservation(receipt, topicId, error('context preparation failed'), () => {
-        if (!storageAvailable) throw new Error('db unavailable')
-      })
+      const persistencePort = new FakePersistencePort('persistence:reservation-recovery')
+      persistencePort.onErrorImpl = () => {
+        if (!storageAvailable) throw new TerminalPersistenceError(error('db unavailable'), false)
+      }
+      mgr.registerReservedAttemptTerminals(topicId, receipt, [
+        { modelId: 'provider-a::model-a', anchorMessageId: 'assistant-reserved', port: persistencePort }
+      ])
+      await mgr.settleDispatchPreparationFailure(receipt, topicId, error('context preparation failed'))
 
       expect(() => mgr.reserveDispatchCommand(topicId, intent, 1, { kind: 'none' })).toThrow(
         aiStreamAdmissionReasons.TOPIC_BUSY
@@ -628,9 +688,14 @@ describe('AiStreamManager', () => {
       // Topic A: a failed dispatch reservation whose durable error write keeps failing.
       const intent = { kind: 'start' as const, modelCount: 1 }
       const { receipt } = mgr.reserveDispatchCommand('topic-a', intent, 1, { kind: 'none' })
-      mgr.failDispatchReservation(receipt, 'topic-a', error('context preparation failed'), () => {
-        throw new Error('db unavailable')
-      })
+      const reservationPort = new FakePersistencePort('persistence:topic-a-reservation')
+      reservationPort.onErrorImpl = () => {
+        throw new TerminalPersistenceError(error('db unavailable'), false)
+      }
+      mgr.registerReservedAttemptTerminals('topic-a', receipt, [
+        { modelId: 'provider-a::model-a', anchorMessageId: 'assistant-topic-a', port: reservationPort }
+      ])
+      await mgr.settleDispatchPreparationFailure(receipt, 'topic-a', error('context preparation failed'))
 
       // One sweep starts BOTH recoveries: topic A's settles quickly, topic B's hangs.
       void mgr.retryBlockedPersistence()
@@ -745,24 +810,27 @@ describe('AiStreamManager', () => {
       mockStreamText.mockResolvedValueOnce(current.stream)
 
       const liveListener = new FakeListener('agent-runtime:live')
+      const liveOwnershipLeaseId = openAgentOwnership(mgr, 'agent-session:s1')
       mgr.startRuntimeTurn({
         topicId: 'agent-session:s1',
         modelId: 'provider-a::model-a',
         request: req('agent-session:s1'),
         listeners: [liveListener],
-        admission: { kind: 'fresh' }
+        admission: { kind: 'fresh', ownershipLeaseId: liveOwnershipLeaseId }
       })
       await vi.waitFor(() => expect(mockStreamText).toHaveBeenCalledTimes(1))
 
+      const rejectedOwnershipLeaseId = openAgentOwnership(mgr, 'agent-session:s1')
       expect(() =>
         mgr.startRuntimeTurn({
           topicId: 'agent-session:s1',
           modelId: 'provider-a::model-a',
           request: req('agent-session:s1'),
           listeners: [new FakeListener('agent-runtime:next')],
-          admission: { kind: 'fresh' }
+          admission: { kind: 'fresh', ownershipLeaseId: rejectedOwnershipLeaseId }
         })
       ).toThrow(AiStreamAdmissionError)
+      mgr.releaseAgentRuntimeOwnershipLease('agent-session:s1', rejectedOwnershipLeaseId, 'handoff-rejected')
       expect(mockStreamText).toHaveBeenCalledTimes(1)
       expect(mgr.inspect('agent-session:s1')?.status).toBe('pending')
       expect(mgr.inspect('agent-session:s1')?.listenerIds).not.toContain('agent-runtime:next')
@@ -1969,7 +2037,6 @@ describe('AiStreamManager', () => {
         expect.anything(),
         expect.objectContaining({ trigger: 'steer-continuation', topicId: 'a', userMessageId: 'u1' })
       )
-      expect(mgr.hasPendingSteer('a')).toBe(false)
     })
 
     it('keeps an agent-session continuation alive after blocked persistence recovers', async () => {
@@ -2722,12 +2789,15 @@ describe('AiStreamManager', () => {
     const flush = async () => {
       for (let i = 0; i < 6; i++) await Promise.resolve()
     }
-    const steerReq = (topicId: string, userMessageId: string) => ({
-      trigger: 'steer-continuation',
-      topicId,
-      userMessageId,
-      fastMode: false
-    })
+    const steerReq = (topicId: string, userMessageId: string) =>
+      expect.objectContaining({
+        trigger: 'steer-continuation',
+        topicId,
+        userMessageId,
+        chatSteerId: expect.any(String),
+        continuationLeaseId: expect.any(String),
+        fastMode: false
+      })
 
     it('rebroadcasts awaiting-approval anchors when a live stream pauses and resumes for tool approval', () => {
       // No status transition happens on a mid-stream permission pause, so the shared-cache entry must
@@ -2857,7 +2927,6 @@ describe('AiStreamManager', () => {
       await flush()
       expect(dispatchSpy).toHaveBeenCalledTimes(1)
       expect(dispatchSpy).toHaveBeenCalledWith(expect.anything(), steerReq('a', 'u1'))
-      expect(mgr.hasPendingSteer('a')).toBe(false)
     })
 
     it('drains a steer that lands during the terminal persistence window', async () => {
@@ -2881,7 +2950,6 @@ describe('AiStreamManager', () => {
       await flush()
       expect(dispatchSpy).toHaveBeenCalledTimes(1)
       expect(dispatchSpy).toHaveBeenCalledWith(expect.anything(), steerReq('a', 'u1'))
-      expect(mgr.hasPendingSteer('a')).toBe(false)
     })
 
     it('a finished turn with a queued steer chains a continuation instead of finishing (no idle flicker)', async () => {
@@ -3023,9 +3091,20 @@ describe('AiStreamManager', () => {
       vi.spyOn(mgr, 'dispatch').mockImplementation(async (_subscriber, dispatchReq) => {
         // Stand-in for prepareSteerContinuation: reserve the attempt (placeholder row), then park
         // in the compaction await where Stop lands; the test fires send() from inside that window.
-        const reservation = mgr.reserveDispatchCommand(dispatchReq.topicId, { kind: 'steer-continuation' }, 1, {
-          kind: 'none'
-        })
+        if (dispatchReq.trigger !== 'steer-continuation') throw new Error('expected steer continuation')
+        const reservation = mgr.reserveDispatchCommand(
+          dispatchReq.topicId,
+          {
+            kind: 'steer-continuation',
+            leaseId: dispatchReq.continuationLeaseId,
+            chatSteerId: dispatchReq.chatSteerId
+          },
+          1,
+          { kind: 'none' }
+        )
+        mgr.registerReservedAttemptTerminals(dispatchReq.topicId, reservation.receipt, [
+          { modelId: 'provider-a::model-a', anchorMessageId: 'assistant-steer', port: persistencePort }
+        ])
         sendPrepared = () =>
           mgr.send({
             topicId: dispatchReq.topicId,
@@ -3464,12 +3543,15 @@ describe('AiStreamManager', () => {
     const flush = async () => {
       for (let i = 0; i < 6; i++) await Promise.resolve()
     }
-    const steerReq = (topicId: string, userMessageId: string) => ({
-      trigger: 'steer-continuation',
-      topicId,
-      userMessageId,
-      fastMode: false
-    })
+    const steerReq = (topicId: string, userMessageId: string) =>
+      expect.objectContaining({
+        trigger: 'steer-continuation',
+        topicId,
+        userMessageId,
+        chatSteerId: expect.any(String),
+        continuationLeaseId: expect.any(String),
+        fastMode: false
+      })
 
     it('tracks the queue and starts a continuation immediately when the topic is idle', async () => {
       const dispatchSpy = vi.spyOn(mgr, 'dispatch').mockResolvedValue({ mode: 'started' } as any)
@@ -3481,7 +3563,6 @@ describe('AiStreamManager', () => {
       await flush()
       expect(dispatchSpy).toHaveBeenCalledTimes(1)
       expect(dispatchSpy).toHaveBeenCalledWith(expect.anything(), steerReq('a', 'u1'))
-      expect(mgr.hasPendingSteer('a')).toBe(false)
     })
 
     it('a finished turn with a queued steer chains a continuation instead of finishing (no idle flicker)', async () => {
@@ -3558,12 +3639,13 @@ describe('AiStreamManager', () => {
       await mgr.onExecutionDone(topicId, 'provider-a::model-a')
       expect(listener.doneResults.at(-1)?.isTopicDone).toBe(false)
 
+      const a2OwnershipLease = openAgentOwnership(mgr, topicId)
       const a2 = mgr.startRuntimeTurn({
         topicId,
         modelId: 'provider-a::model-a',
         request: req(topicId),
         listeners: [],
-        admission: { kind: 'continuation', leaseId: a2Lease }
+        admission: { kind: 'continuation', leaseId: a2Lease, ownershipLeaseId: a2OwnershipLease }
       })
       await mgr.onExecutionDone(topicId, 'provider-a::model-a', toAttemptId(a2.activeExecutions[0].attemptId))
 
@@ -3578,12 +3660,13 @@ describe('AiStreamManager', () => {
       const a2Lease = openAgentContinuation(mgr, topicId)
       await mgr.onExecutionDone(topicId, 'provider-a::model-a')
 
+      const a2OwnershipLease = openAgentOwnership(mgr, topicId)
       const a2 = mgr.startRuntimeTurn({
         topicId,
         modelId: 'provider-a::model-a',
         request: req(topicId),
         listeners: [],
-        admission: { kind: 'continuation', leaseId: a2Lease }
+        admission: { kind: 'continuation', leaseId: a2Lease, ownershipLeaseId: a2OwnershipLease }
       })
       const a3Lease = openAgentContinuation(mgr, topicId)
       expect(a3Lease).not.toBe(a2Lease)
@@ -3591,12 +3674,13 @@ describe('AiStreamManager', () => {
       await mgr.onExecutionDone(topicId, 'provider-a::model-a', toAttemptId(a2.activeExecutions[0].attemptId))
       expect(listener.doneResults.at(-1)?.isTopicDone).toBe(false)
 
+      const a3OwnershipLease = openAgentOwnership(mgr, topicId)
       const a3 = mgr.startRuntimeTurn({
         topicId,
         modelId: 'provider-a::model-a',
         request: req(topicId),
         listeners: [],
-        admission: { kind: 'continuation', leaseId: a3Lease }
+        admission: { kind: 'continuation', leaseId: a3Lease, ownershipLeaseId: a3OwnershipLease }
       })
       await mgr.onExecutionDone(topicId, 'provider-a::model-a', toAttemptId(a3.activeExecutions[0].attemptId))
 
@@ -4250,7 +4334,7 @@ describe('AiStreamManager', () => {
       expect(statusSequence('t')).toEqual(['pending', 'streaming'])
 
       // Subsequent chunks do NOT re-write — `onChunk` only transitions on
-      // the first chunk (`stream.status === 'pending'` guard).
+      // the first chunk (the aggregate status is still `pending`).
       mgr.onChunk('t', 'p::m', chunk('ho'))
       expect(statusSequence('t')).toEqual(['pending', 'streaming'])
 
@@ -4313,12 +4397,13 @@ describe('AiStreamManager', () => {
     it('treats runtime turns as persistent conversations without caller metadata', async () => {
       vi.setSystemTime(2_345)
 
+      const ownershipLeaseId = openAgentOwnership(mgr, 'agent-session:session-1')
       mgr.startRuntimeTurn({
         topicId: 'agent-session:session-1',
         modelId: 'p::m',
         request: req('agent-session:session-1'),
         listeners: [new FakeListener('l:session-1')],
-        admission: { kind: 'fresh' }
+        admission: { kind: 'fresh', ownershipLeaseId }
       })
       await mgr.onExecutionDone('agent-session:session-1', 'p::m')
 

@@ -1,13 +1,13 @@
 import { loggerService } from '@logger'
+import type { SerializedError } from '@shared/types/error'
 
 const logger = loggerService.withContext('TerminalPersistenceCoordinator')
 
 /**
  * A parked terminal write. Identity and immutable payload only — never a closure (P3).
  *
- * The `reservation` variant still carries callbacks: converting it needs `failDispatchReservation`
- * to take its marker rows as data, which is a caller-facing signature change. It captures the
- * receipt and that write, not the stream graph, so it is bounded.
+ * Reservation records resolve their persistence port from AiStreamManager's attempt-keyed resource
+ * registry. No record retains a provider callback or stream graph.
  */
 export type TerminalRecoveryRecord =
   | {
@@ -21,8 +21,9 @@ export type TerminalRecoveryRecord =
   | {
       readonly kind: 'reservation'
       readonly topicId: string
-      retry: () => Promise<boolean>
-      abandon: () => Promise<void>
+      readonly attemptId: number
+      readonly terminal: 'error' | 'paused'
+      readonly error?: SerializedError
     }
 
 /** Runs one record's write. Resolves true when the record is finished and can be released. */

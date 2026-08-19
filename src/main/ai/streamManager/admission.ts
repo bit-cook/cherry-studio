@@ -28,14 +28,16 @@ export type LiveExecutionChangeIntent =
     }
   | { mode: 'start'; modelCount: number }
 
-export type RuntimeTurnAdmission = { kind: 'fresh' } | { kind: 'continuation'; leaseId: ContinuationLeaseId }
+export type RuntimeTurnAdmission =
+  | { kind: 'fresh'; ownershipLeaseId: ContinuationLeaseId }
+  | { kind: 'continuation'; leaseId: ContinuationLeaseId; ownershipLeaseId: ContinuationLeaseId }
 
 export type StreamIntent =
   | { kind: 'start'; modelCount: number }
   | { kind: 'append-live'; change: Extract<LiveExecutionChangeIntent, { mode: 'append' }> }
   | { kind: 'replace-live'; change: Extract<LiveExecutionChangeIntent, { mode: 'replace' }> }
   | { kind: 'steer-inject' }
-  | { kind: 'steer-continuation' }
+  | { kind: 'steer-continuation'; leaseId: ContinuationLeaseId; chatSteerId: string }
   | { kind: 'continue-conversation'; anchorMessageId: string }
   | { kind: 'runtime-turn'; admission: RuntimeTurnAdmission }
   | { kind: 'prompt' }

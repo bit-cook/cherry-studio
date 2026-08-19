@@ -438,9 +438,24 @@ export class AgentSessionDeliveryService extends BaseService {
       agentSessionMessageService.publishDispatchChanges(current.sessionId, persisted.savedMessages)
 
       try {
-        const prepared = agentChatContextProvider.activateDispatch(
+        const ownership = runtime.prepareTurnOwnership(topicId, current.sessionId)
+        let reservation
+        try {
+          reservation = manager.reserveDispatchCommand(
+            topicId,
+            { kind: 'runtime-turn', admission: { kind: 'fresh', ownershipLeaseId: ownership.leaseId } },
+            1,
+            { kind: 'none' }
+          )
+        } catch (error) {
+          manager.releaseAgentRuntimeOwnershipLease(topicId, ownership.leaseId, 'handoff-rejected')
+          throw error
+        }
+        const prepared = await agentChatContextProvider.activateDispatch(
           persisted,
-          new AgentSessionDeliverySubscriber(current.id)
+          new AgentSessionDeliverySubscriber(current.id),
+          reservation.receipt,
+          ownership
         )
         try {
           manager.send({
@@ -450,7 +465,8 @@ export class AgentSessionDeliveryService extends BaseService {
             persistencePorts: prepared.persistencePorts,
             cleanupPorts: prepared.cleanupPorts,
             siblingsGroupId: prepared.siblingsGroupId,
-            lifecycle: prepared.lifecycle
+            lifecycle: prepared.lifecycle,
+            receipt: prepared.receipt
           })
         } catch (error) {
           // send() launches before its final lifecycle callback. A callback failure can therefore

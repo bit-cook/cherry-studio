@@ -23,6 +23,9 @@ const mocks = vi.hoisted(() => ({
   validateDispatch: vi.fn(),
   persistDispatchTx: vi.fn(),
   activateDispatch: vi.fn(),
+  reserveDispatch: vi.fn(),
+  releaseOwnership: vi.fn(),
+  prepareTurnOwnership: vi.fn(),
   send: vi.fn(),
   hasLiveStream: vi.fn(),
   pauseRuntimeTurn: vi.fn(),
@@ -86,6 +89,7 @@ vi.mock('../../streamManager/context/AgentChatContextProvider', () => ({
 
 const runtime = {
   isSessionBusy: mocks.runtimeBusy,
+  prepareTurnOwnership: mocks.prepareTurnOwnership,
   closeSession: mocks.closeSession,
   onTurnTerminal: (listener: (event: any) => void) => {
     mocks.terminalListeners.add(listener)
@@ -102,6 +106,8 @@ const manager = {
   hasLiveStream: mocks.hasLiveStream,
   pauseRuntimeTurn: mocks.pauseRuntimeTurn,
   hasTerminalPersistenceInFlight: mocks.hasTerminalPersistenceInFlight,
+  reserveDispatchCommand: mocks.reserveDispatch,
+  releaseAgentRuntimeOwnershipLease: mocks.releaseOwnership,
   send: mocks.send
 }
 const dbService = {
@@ -157,6 +163,19 @@ describe('AgentSessionDeliveryService', () => {
     mocks.hasTerminalPersistenceInFlight.mockReturnValue(false)
     mocks.runtimeBusy.mockReturnValue(false)
     mocks.closeSession.mockResolvedValue(undefined)
+    mocks.prepareTurnOwnership.mockReturnValue({ turnId: 'turn-1', leaseId: 'ownership-1' })
+    mocks.reserveDispatch.mockReturnValue({
+      receipt: {
+        intent: {
+          kind: 'runtime-turn',
+          admission: { kind: 'fresh', ownershipLeaseId: 'ownership-1' }
+        },
+        admission: { mode: 'start-new' },
+        activeNodeDecision: { move: 'advance' },
+        reservedAttemptIds: [1]
+      },
+      rows: { kind: 'none' }
+    })
     mocks.getMessage.mockReturnValue(accepted)
     mocks.markTerminalError.mockReset()
     mocks.validateDispatch.mockResolvedValue({
@@ -171,12 +190,13 @@ describe('AgentSessionDeliveryService', () => {
       savedMessages: [accepted, assistant]
     })
     mocks.claim.mockReturnValue({ ...accepted, delivery: { ...accepted.delivery, status: 'delivering' } })
-    mocks.activateDispatch.mockReturnValue({
+    mocks.activateDispatch.mockImplementation((_persisted, _subscriber, receipt) => ({
       topicId: 'agent-session:target',
       models: [{ modelId: 'provider::model', request: {} }],
       listeners: [],
-      isMultiModel: false
-    })
+      isMultiModel: false,
+      receipt
+    }))
     mocks.send.mockReturnValue({ mode: 'started', executionIds: ['provider::model'] })
     mocks.fail.mockReturnValue(null)
     mocks.finalize.mockReturnValue(null)
@@ -226,6 +246,13 @@ describe('AgentSessionDeliveryService', () => {
     })
     expect(mocks.claim).toHaveBeenCalledWith({}, 'target', 'delivery-1', 'assistant-1')
     expect(mocks.publishDispatchChanges).toHaveBeenCalledWith('target', [accepted, assistant])
+    expect(mocks.prepareTurnOwnership).toHaveBeenCalledWith('agent-session:target', 'target')
+    expect(mocks.reserveDispatch).toHaveBeenCalledWith(
+      'agent-session:target',
+      { kind: 'runtime-turn', admission: { kind: 'fresh', ownershipLeaseId: 'ownership-1' } },
+      1,
+      { kind: 'none' }
+    )
     expect(mocks.send).toHaveBeenCalledOnce()
   })
 

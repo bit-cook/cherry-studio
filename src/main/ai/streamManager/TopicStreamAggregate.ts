@@ -1,5 +1,6 @@
 import type { AttemptId } from '@shared/ai/attempt'
 import type { TopicStreamStatus } from '@shared/ai/transport'
+import type { SerializedError } from '@shared/types/error'
 
 import {
   type AttemptEvent,
@@ -19,6 +20,7 @@ import {
   hasPersistenceBlockedAttempts,
   hasUnsettledAttempts,
   isQuiescent,
+  type PendingChatSteer,
   reduceTopicStream,
   runtimeOutcome,
   type TopicAttemptState,
@@ -26,6 +28,7 @@ import {
   type TopicContinuationLease,
   topicStatus,
   type TopicStreamCommand,
+  type TopicStreamEffect,
   type TopicStreamEvent,
   type TopicStreamFlagEffect,
   type TopicStreamState
@@ -41,7 +44,7 @@ export interface PreparedTopicCommit {
   readonly expectedRevision: number
   readonly nextState: TopicStreamState
   readonly events: readonly TopicStreamEvent[]
-  readonly effects: readonly TopicStreamFlagEffect[]
+  readonly effects: readonly TopicStreamEffect[]
   readonly changed: boolean
   readonly rejection?: TopicCommandRejection
 }
@@ -52,6 +55,7 @@ export interface TopicCommitReceipt {
   readonly previousRevision: number
   readonly revision: number
   readonly events: readonly TopicStreamEvent[]
+  readonly effects: readonly TopicStreamEffect[]
 }
 
 /** Applies a resource-flag effect. MUST be synchronous — see T8 in the runtime-rework plan. */
@@ -130,13 +134,16 @@ export class TopicStreamAggregate {
     const previousRevision = this.current.revision
     this.current = prepared.nextState
     // T8: flag effects land in the same synchronous turn as the commit that produced them.
-    for (const effect of prepared.effects) this.effectSink?.(effect)
+    for (const effect of prepared.effects) {
+      if (effect.type === 'set-ring-eviction') this.effectSink?.(effect)
+    }
     return {
       topicId: this.topicId,
       cycleId: this.cycleId,
       previousRevision,
       revision: this.current.revision,
-      events: prepared.events
+      events: prepared.events,
+      effects: prepared.effects
     }
   }
 
@@ -246,11 +253,34 @@ export class TopicStreamAggregate {
   openContinuationLease(
     id: ContinuationLeaseId,
     diagnosticOwner: 'agent-runtime' | 'chat-steer',
-    voidOnAttemptError = false
+    voidOnAttemptError = false,
+    kind: 'continuation' | 'runtime-ownership' = 'continuation'
   ): boolean {
     return (
-      this.apply({ type: 'continuation-opened', leaseId: id, diagnosticOwner, voidOnAttemptError }).events.length > 0
+      this.apply({ type: 'continuation-opened', leaseId: id, diagnosticOwner, voidOnAttemptError, kind }).events
+        .length > 0
     )
+  }
+
+  enqueueChatSteer(steer: PendingChatSteer): boolean {
+    const receipt = this.apply({ type: 'enqueue-chat-steer', steer })
+    return receipt.revision !== receipt.previousRevision
+  }
+
+  pendingChatSteers(): readonly PendingChatSteer[] {
+    return this.current.pendingChatSteers
+  }
+
+  dropChatSteers(reason: ContinuationReleaseReason): TopicCommitReceipt {
+    return this.apply({ type: 'drop-chat-steers', reason })
+  }
+
+  stop(reason: string): TopicCommitReceipt {
+    return this.apply({ type: 'stop-topic', reason })
+  }
+
+  failDispatchPreparation(attemptIds: readonly AttemptId[], error: SerializedError): TopicCommitReceipt {
+    return this.apply({ type: 'dispatch-preparation-failed', attemptIds, error })
   }
 
   updateContinuationLease(id: ContinuationLeaseId, voidOnAttemptError: boolean): boolean {

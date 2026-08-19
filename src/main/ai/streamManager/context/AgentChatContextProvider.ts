@@ -19,10 +19,11 @@ import type { ReasoningEffortOption } from '@shared/types/aiSdk'
 import type { UIMessage } from 'ai'
 import { v7 as uuidv7 } from 'uuid'
 
+import type { AgentRuntimeTurnOwnership } from '../../agentSession/AgentSessionRuntimeService'
 import { extractAgentSessionId, isAgentSessionTopic } from '../../agentSession/topic'
 import { applyTurnInputAttributes, startAiChildTurnSpan } from '../../observability'
 import { runtimeDriverRegistry } from '../../runtime/registry'
-import type { StreamListener } from '../types'
+import type { StreamListener, StreamPersistencePort } from '../types'
 import type { ChatContextProvider, DispatchContext, PreparedDispatch } from './ChatContextProvider'
 import type { MainDispatchRequest } from './dispatch'
 
@@ -190,11 +191,12 @@ export class AgentChatContextProvider implements ChatContextProvider {
     }
   }
 
-  activateDispatch(
+  async activateDispatch(
     persisted: PersistedAgentDispatch,
     subscriber: StreamListener,
-    receipt?: PreparedDispatch['receipt']
-  ): PreparedDispatch {
+    receipt?: PreparedDispatch['receipt'],
+    ownership?: AgentRuntimeTurnOwnership
+  ): Promise<PreparedDispatch> {
     const { validated, assistantMessageId, traceId, userMessage, savedMessages } = persisted
     if (validated.shouldAutoNameInitialTurn) {
       topicNamingService.maybeRenameAgentSessionFromFirstUserMessage(validated.sessionId, userMessage.data)
@@ -224,6 +226,38 @@ export class AgentChatContextProvider implements ChatContextProvider {
       agentName: validated.agentName
     })
 
+    if (receipt) {
+      const reservedTerminalPort: StreamPersistencePort = {
+        id: `persistence:agent-reservation:${validated.sessionId}:${assistantMessageId}`,
+        onDone: () => {},
+        onPaused: () => {
+          agentSessionMessageService.settlePendingAssistantMessage({
+            sessionId: validated.sessionId,
+            messageId: assistantMessageId,
+            status: 'paused',
+            data: { parts: [] },
+            modelId: validated.uniqueModelId
+          })
+        },
+        onError: ({ error }) => {
+          agentSessionMessageService.settlePendingAssistantMessage({
+            sessionId: validated.sessionId,
+            messageId: assistantMessageId,
+            status: 'error',
+            data: { parts: [{ type: 'data-error', data: error }] },
+            modelId: validated.uniqueModelId
+          })
+        }
+      }
+      application.get('AiStreamManager').registerReservedAttemptTerminals(validated.topicId, receipt, [
+        {
+          modelId: validated.uniqueModelId,
+          anchorMessageId: assistantMessageId,
+          port: reservedTerminalPort
+        }
+      ])
+    }
+
     let runtime
     try {
       runtime = application.get('AgentSessionRuntimeService').beginTurn({
@@ -239,25 +273,16 @@ export class AgentChatContextProvider implements ChatContextProvider {
         headless: validated.headless,
         traceId,
         messageSnapshot: validated.messageSnapshot,
-        shouldAutoName: validated.shouldAutoNameInitialTurn
+        shouldAutoName: validated.shouldAutoNameInitialTurn,
+        ownership
       })
     } catch (error) {
       if (receipt) {
-        application.get('AiStreamManager').failDispatchReservation(
-          receipt,
-          validated.topicId,
-          serializeError(error),
-          () => {
-            agentSessionMessageService.settlePendingAssistantMessage({
-              sessionId: validated.sessionId,
-              messageId: assistantMessageId,
-              status: 'error',
-              data: { parts: [] },
-              modelId: validated.uniqueModelId
-            })
-          },
-          [{ modelId: validated.uniqueModelId, anchorMessageId: assistantMessageId }]
-        )
+        await application
+          .get('AiStreamManager')
+          .settleDispatchPreparationFailure(receipt, validated.topicId, serializeError(error), [
+            { modelId: validated.uniqueModelId, anchorMessageId: assistantMessageId }
+          ])
       }
       turnTrace.end('error', error instanceof Error ? error : new Error(String(error)))
       throw error
@@ -337,13 +362,30 @@ export class AgentChatContextProvider implements ChatContextProvider {
       }
     }
 
-    const committed = application
-      .get('AiStreamManager')
-      .reserveDispatchCommand(validated.topicId, { kind: 'start', modelCount: 1 }, 1, {
-        kind: 'tx-write',
-        write: (tx) => this.persistDispatchTx(tx, validated, ctx?.expectedAgentId)
-      })
-    return this.activateDispatch(committed.rows.value as PersistedAgentDispatch, subscriber, committed.receipt)
+    const runtime = application.get('AgentSessionRuntimeService')
+    const manager = application.get('AiStreamManager')
+    const ownership = runtime.prepareTurnOwnership(validated.topicId, validated.sessionId)
+    let committed
+    try {
+      committed = manager.reserveDispatchCommand(
+        validated.topicId,
+        { kind: 'runtime-turn', admission: { kind: 'fresh', ownershipLeaseId: ownership.leaseId } },
+        1,
+        {
+          kind: 'tx-write',
+          write: (tx) => this.persistDispatchTx(tx, validated, ctx?.expectedAgentId)
+        }
+      )
+    } catch (error) {
+      manager.releaseAgentRuntimeOwnershipLease(validated.topicId, ownership.leaseId, 'handoff-rejected')
+      throw error
+    }
+    return this.activateDispatch(
+      committed.rows.value as PersistedAgentDispatch,
+      subscriber,
+      committed.receipt,
+      ownership
+    )
   }
 }
 

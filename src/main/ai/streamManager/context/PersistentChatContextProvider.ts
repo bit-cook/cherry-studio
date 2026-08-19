@@ -438,6 +438,44 @@ export class PersistentChatContextProvider implements ChatContextProvider {
         topicNamingService.maybeRenameFromFirstUserMessage(req.topicId, userMessage.id)
       }
 
+      const assistantPlaceholders = turnRootSpans.map(({ model, span }, i) => ({
+        model,
+        placeholder: placeholders[i],
+        rootSpan: span
+      }))
+      const persistencePorts = assistantPlaceholders.map(
+        ({ model, placeholder }, index) =>
+          new PersistenceListener({
+            topicId: req.topicId,
+            modelId: model.id,
+            backend: new MessageServiceBackend({
+              assistantMessageId: placeholder.id,
+              turnOptions,
+              contextSettingsOverride,
+              afterPersist:
+                shouldAutoNameInitialTurn && index === 0
+                  ? async (finalMessage) => {
+                      await topicNamingService.maybeRenameFromConversationSummary(
+                        req.topicId,
+                        assistantId,
+                        userMessage.id,
+                        finalMessage
+                      )
+                    }
+                  : undefined
+            })
+          })
+      )
+      manager.registerReservedAttemptTerminals(
+        req.topicId,
+        receipt,
+        assistantPlaceholders.map(({ model, placeholder }, index) => ({
+          modelId: model.id,
+          anchorMessageId: placeholder.id,
+          port: persistencePorts[index]
+        }))
+      )
+
       const { messages: history, retainedContext } = await this.resolveCompactedHistory(
         userMessage.id,
         req.topicId,
@@ -461,41 +499,7 @@ export class PersistentChatContextProvider implements ChatContextProvider {
             }
           : undefined
 
-      const assistantPlaceholders = turnRootSpans.map(({ model, span }, i) => ({
-        model,
-        placeholder: placeholders[i],
-        rootSpan: span
-      }))
-
-      // 1 subscriber + N per-model persistence listeners. Auto-rename attaches
-      // to the first backend only so it fires once for multi-model turns.
       const listeners: StreamListener[] = [subscriber]
-      const persistencePorts: PersistenceListener[] = []
-      for (let i = 0; i < assistantPlaceholders.length; i++) {
-        const { model, placeholder } = assistantPlaceholders[i]
-        const attachAutoRename = shouldAutoNameInitialTurn && i === 0
-        persistencePorts.push(
-          new PersistenceListener({
-            topicId: req.topicId,
-            modelId: model.id,
-            backend: new MessageServiceBackend({
-              assistantMessageId: placeholder.id,
-              turnOptions,
-              contextSettingsOverride,
-              afterPersist: attachAutoRename
-                ? async (finalMessage) => {
-                    await topicNamingService.maybeRenameFromConversationSummary(
-                      req.topicId,
-                      assistantId,
-                      userMessage.id,
-                      finalMessage
-                    )
-                  }
-                : undefined
-            })
-          })
-        )
-      }
       const cleanupPorts = [new TraceFlushListener(req.topicId)]
 
       // 7. Build per-model requests. The dispatcher runs `manager.send` itself.
@@ -543,11 +547,10 @@ export class PersistentChatContextProvider implements ChatContextProvider {
           error instanceof Error
             ? { name: error.name, message: error.message, stack: error.stack ?? null }
             : { name: 'Error', message: String(error), stack: null }
-        application.get('AiStreamManager').failDispatchReservation(
+        await application.get('AiStreamManager').settleDispatchPreparationFailure(
           reservation.receipt,
           req.topicId,
           serialized,
-          () => messageService.markMessagesError(reservation?.placeholders.map((message) => message.id) ?? []),
           turnRootSpans.map(({ model }, index) => ({
             modelId: model.id,
             anchorMessageId: reservation?.placeholders[index].id ?? ''
@@ -610,6 +613,20 @@ export class PersistentChatContextProvider implements ChatContextProvider {
         messageId: target.id
       })
       reservation = { receipt: committed.receipt, resetMessage: committed.rows.resetMessage }
+      const persistencePorts = [
+        new PersistenceListener({
+          topicId: req.topicId,
+          modelId: model.id,
+          backend: new MessageServiceBackend({
+            assistantMessageId: target.id,
+            turnOptions,
+            contextSettingsOverride
+          })
+        })
+      ]
+      manager.registerReservedAttemptTerminals(req.topicId, reservation.receipt, [
+        { modelId: model.id, anchorMessageId: target.id, port: persistencePorts[0] }
+      ])
 
       const { messages: history, retainedContext } = await this.resolveCompactedHistory(
         parent.id,
@@ -639,17 +656,6 @@ export class PersistentChatContextProvider implements ChatContextProvider {
 
       const { receipt, resetMessage } = reservation
       const listeners: StreamListener[] = [subscriber]
-      const persistencePorts = [
-        new PersistenceListener({
-          topicId: req.topicId,
-          modelId: model.id,
-          backend: new MessageServiceBackend({
-            assistantMessageId: target.id,
-            turnOptions,
-            contextSettingsOverride
-          })
-        })
-      ]
 
       return {
         topicId: req.topicId,
@@ -679,13 +685,9 @@ export class PersistentChatContextProvider implements ChatContextProvider {
     } catch (error) {
       if (reservation) {
         const serialized = serializeError(error)
-        manager.failDispatchReservation(
-          reservation.receipt,
-          req.topicId,
-          serialized,
-          () => messageService.markMessagesError([target.id]),
-          [{ modelId: model.id, anchorMessageId: target.id }]
-        )
+        await manager.settleDispatchPreparationFailure(reservation.receipt, req.topicId, serialized, [
+          { modelId: model.id, anchorMessageId: target.id }
+        ])
       }
       endTurnRootSpansWithError(turnRootSpans, error)
       throw error
@@ -737,6 +739,20 @@ export class PersistentChatContextProvider implements ChatContextProvider {
         messageId: req.parentAnchorId,
         data: { ...anchor.data, parts: updatedParts }
       }).receipt
+      const persistencePorts = [
+        new PersistenceListener({
+          topicId: req.topicId,
+          modelId: model.id,
+          backend: new MessageServiceBackend({
+            assistantMessageId: anchor.id,
+            turnOptions: anchor.data.turnOptions,
+            contextSettingsOverride
+          })
+        })
+      ]
+      manager.registerReservedAttemptTerminals(req.topicId, receipt, [
+        { modelId: model.id, anchorMessageId: anchor.id, port: persistencePorts[0] }
+      ])
       const { messages: storedHistory, retainedContext } = await this.resolveCompactedHistory(
         anchor.id,
         req.topicId,
@@ -749,17 +765,6 @@ export class PersistentChatContextProvider implements ChatContextProvider {
         message.id === anchor.id ? ({ ...message, parts: updatedParts } as CherryUIMessage) : message
       )
       const listeners: StreamListener[] = [subscriber]
-      const persistencePorts = [
-        new PersistenceListener({
-          topicId: req.topicId,
-          modelId: model.id,
-          backend: new MessageServiceBackend({
-            assistantMessageId: anchor.id,
-            turnOptions: anchor.data.turnOptions,
-            contextSettingsOverride
-          })
-        })
-      ]
       return {
         topicId: req.topicId,
         models: [
@@ -788,13 +793,9 @@ export class PersistentChatContextProvider implements ChatContextProvider {
       }
     } catch (error) {
       if (receipt) {
-        manager.failDispatchReservation(
-          receipt,
-          req.topicId,
-          serializeError(error),
-          () => messageService.markMessagesError([anchor.id]),
-          [{ modelId: model.id, anchorMessageId: anchor.id }]
-        )
+        await manager.settleDispatchPreparationFailure(receipt, req.topicId, serializeError(error), [
+          { modelId: model.id, anchorMessageId: anchor.id }
+        ])
       }
       endTurnRootSpansWithError(turnRootSpans, error)
       throw error
@@ -834,23 +835,50 @@ export class PersistentChatContextProvider implements ChatContextProvider {
     let reservation: { receipt: DispatchCommandReceipt; placeholder: SharedMessage } | undefined
     try {
       const contextSettingsOverride = resolveAssistantContextOverride(assistantId)
-      const committed = manager.reserveDispatchCommand(req.topicId, { kind: 'steer-continuation' }, 1, {
-        kind: 'user-with-placeholders',
-        input: {
-          topicId: req.topicId,
-          userMessage: { mode: 'existing', id: req.userMessageId },
-          placeholders: [
-            {
-              role: 'assistant',
-              data: { parts: [], turnOptions },
-              status: 'pending',
-              modelId: model.id,
-              messageSnapshot
-            }
-          ]
+      const committed = manager.reserveDispatchCommand(
+        req.topicId,
+        {
+          kind: 'steer-continuation',
+          leaseId: req.continuationLeaseId,
+          chatSteerId: req.chatSteerId
+        },
+        1,
+        {
+          kind: 'user-with-placeholders',
+          input: {
+            topicId: req.topicId,
+            userMessage: { mode: 'existing', id: req.userMessageId },
+            placeholders: [
+              {
+                role: 'assistant',
+                data: { parts: [], turnOptions },
+                status: 'pending',
+                modelId: model.id,
+                messageSnapshot
+              }
+            ]
+          }
         }
-      })
+      )
       reservation = { receipt: committed.receipt, placeholder: committed.rows.placeholders[0] }
+      const persistencePorts = [
+        new PersistenceListener({
+          topicId: req.topicId,
+          modelId: model.id,
+          backend: new MessageServiceBackend({
+            assistantMessageId: reservation.placeholder.id,
+            turnOptions,
+            contextSettingsOverride
+          })
+        })
+      ]
+      manager.registerReservedAttemptTerminals(req.topicId, reservation.receipt, [
+        {
+          modelId: model.id,
+          anchorMessageId: reservation.placeholder.id,
+          port: persistencePorts[0]
+        }
+      ])
       const { messages: compactedHistory, retainedContext } = await this.resolveCompactedHistory(
         req.userMessageId,
         req.topicId,
@@ -862,17 +890,6 @@ export class PersistentChatContextProvider implements ChatContextProvider {
       const history = withSteerReminder(compactedHistory)
       const { receipt, placeholder } = reservation
       const listeners: StreamListener[] = [subscriber]
-      const persistencePorts = [
-        new PersistenceListener({
-          topicId: req.topicId,
-          modelId: model.id,
-          backend: new MessageServiceBackend({
-            assistantMessageId: placeholder.id,
-            turnOptions,
-            contextSettingsOverride
-          })
-        })
-      ]
       return {
         topicId: req.topicId,
         models: [
@@ -900,13 +917,9 @@ export class PersistentChatContextProvider implements ChatContextProvider {
       }
     } catch (error) {
       if (reservation) {
-        manager.failDispatchReservation(
-          reservation.receipt,
-          req.topicId,
-          serializeError(error),
-          () => messageService.markMessagesError([reservation?.placeholder.id ?? '']),
-          [{ modelId: model.id, anchorMessageId: reservation.placeholder.id }]
-        )
+        await manager.settleDispatchPreparationFailure(reservation.receipt, req.topicId, serializeError(error), [
+          { modelId: model.id, anchorMessageId: reservation.placeholder.id }
+        ])
       }
       endTurnRootSpansWithError(turnRootSpans, error)
       throw error

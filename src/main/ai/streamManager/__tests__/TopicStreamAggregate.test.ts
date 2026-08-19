@@ -28,22 +28,109 @@ describe('TopicStreamAggregate', () => {
     expect(aggregate.attemptWatermark()).toBe(fast.id)
   })
 
-  it('keeps a durably settled attempt parked while an approval gate is unresolved', () => {
+  it('settles an awaiting approval attempt and reserves its continuation in one commit', () => {
     const aggregate = new TopicStreamAggregate('topic-1')
     const attempt = aggregate.reserveAttempt(toAttemptId(1))
 
     aggregate.transitionAttempt(attempt.id, { type: 'launch' })
     aggregate.setApprovalPending(attempt.id, 'tool-1', true)
     aggregate.transitionAttempt(attempt.id, { type: 'complete' })
-    aggregate.transitionAttempt(attempt.id, { type: 'persisted' })
+    aggregate.transitionAttempt(attempt.id, { type: 'approval-persisted' })
 
+    expect(aggregate.attemptState(attempt.id)?.phase).toBe('awaiting-approval')
     expect(aggregate.isQuiescent()).toBe(false)
     expect(aggregate.status()).toBe('awaiting-approval')
 
-    aggregate.setApprovalPending(attempt.id, 'tool-1', false)
+    const continuationId = toAttemptId(2)
+    const prepared = aggregate.prepare({
+      type: 'reserve-dispatch',
+      attemptIds: [continuationId],
+      reservation: { kind: 'approval-resume', attemptId: attempt.id }
+    })
+    aggregate.commit(prepared)
 
-    expect(aggregate.isQuiescent()).toBe(true)
-    expect(aggregate.status()).toBe('done')
+    expect(aggregate.attemptState(attempt.id)).toMatchObject({ phase: 'settled', outcome: { kind: 'done' } })
+    expect(aggregate.attempt(attempt.id)?.pendingApprovalToolCallIds.size).toBe(0)
+    expect(aggregate.attemptState(continuationId)).toEqual({ phase: 'reserved' })
+    expect(aggregate.isQuiescent()).toBe(false)
+  })
+
+  it('stops one awaiting-approval branch without changing settled siblings', () => {
+    const aggregate = new TopicStreamAggregate('topic-1')
+    const settled = aggregate.reserveAttempt(toAttemptId(1))
+    const awaiting = aggregate.reserveAttempt(toAttemptId(2))
+    for (const attempt of [settled, awaiting]) {
+      aggregate.transitionAttempt(attempt.id, { type: 'launch' })
+      aggregate.transitionAttempt(attempt.id, { type: 'complete' })
+    }
+    aggregate.transitionAttempt(settled.id, { type: 'persisted' })
+    aggregate.setApprovalPending(awaiting.id, 'tool-1', true)
+    aggregate.transitionAttempt(awaiting.id, { type: 'approval-persisted' })
+
+    const stopped = aggregate.stop('user-requested')
+
+    expect(aggregate.attemptState(settled.id)).toMatchObject({ phase: 'settled', outcome: { kind: 'done' } })
+    expect(aggregate.attemptState(awaiting.id)).toMatchObject({
+      phase: 'finalizing',
+      outcome: { kind: 'aborted', reason: 'user-requested' }
+    })
+    expect(stopped.effects).toContainEqual({
+      type: 'stop-attempt',
+      attemptId: awaiting.id,
+      priorPhase: 'awaiting-approval',
+      reason: 'user-requested'
+    })
+  })
+
+  it('owns chat steer FIFO and consumes only the exact queue head', () => {
+    const aggregate = new TopicStreamAggregate('topic-1')
+    const firstLease = toContinuationLeaseId('steer-1')
+    const secondLease = toContinuationLeaseId('steer-2')
+    aggregate.enqueueChatSteer({ id: 'first', leaseId: firstLease, userMessageId: 'u1', fastMode: false })
+    aggregate.enqueueChatSteer({ id: 'second', leaseId: secondLease, userMessageId: 'u2', fastMode: true })
+
+    const wrongHead = aggregate.prepare({
+      type: 'reserve-dispatch',
+      attemptIds: [toAttemptId(1)],
+      reservation: { kind: 'continuation', leaseId: secondLease, chatSteerId: 'second' }
+    })
+    expect(wrongHead.rejection).toBe('invalid-continuation')
+
+    aggregate.commit(
+      aggregate.prepare({
+        type: 'reserve-dispatch',
+        attemptIds: [toAttemptId(1)],
+        reservation: { kind: 'continuation', leaseId: firstLease, chatSteerId: 'first' }
+      })
+    )
+    expect(aggregate.pendingChatSteers().map((steer) => steer.id)).toEqual(['second'])
+    expect(aggregate.continuationLease(firstLease)).toMatchObject({ state: 'consumed', attemptId: toAttemptId(1) })
+
+    aggregate.dropChatSteers('queue-cleared')
+    expect(aggregate.pendingChatSteers()).toEqual([])
+    expect(aggregate.continuationLease(secondLease)).toMatchObject({ state: 'released', reason: 'queue-cleared' })
+  })
+
+  it('requires and consumes fresh Agent ownership while Stop preserves an open runtime owner', () => {
+    const aggregate = new TopicStreamAggregate('agent-session:session-1')
+    const ownership = toContinuationLeaseId('runtime-owner-1')
+    aggregate.openContinuationLease(ownership, 'agent-runtime', false, 'runtime-ownership')
+
+    const attemptId = toAttemptId(1)
+    aggregate.commit(
+      aggregate.prepare({
+        type: 'reserve-dispatch',
+        attemptIds: [attemptId],
+        reservation: { kind: 'fresh', ownershipLeaseId: ownership }
+      })
+    )
+    expect(aggregate.continuationLease(ownership)).toMatchObject({ state: 'consumed', attemptId })
+
+    const terminalOwner = toContinuationLeaseId('runtime-owner-terminal')
+    aggregate.openContinuationLease(terminalOwner, 'agent-runtime', false, 'runtime-ownership')
+    aggregate.stop('user-requested')
+    expect(aggregate.continuationLease(terminalOwner)).toMatchObject({ state: 'open', kind: 'runtime-ownership' })
+    expect(aggregate.isQuiescent()).toBe(false)
   })
 
   it('does not quiesce when neither the final projection nor an error marker is durable', () => {
